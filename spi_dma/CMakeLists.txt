@@ -1,4 +1,4 @@
-﻿# Generated Cmake Pico project file
+# Generated Cmake Pico project file
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -33,6 +33,7 @@ add_subdirectory(pico_fatfs_reference)
 
 add_executable(spi_dma
         spi_dma.c
+                bdf_writer.c
         )
 
 target_link_libraries(spi_dma
