@@ -6,7 +6,7 @@
 #include "tf_card.h"
 #include "bdf_writer.h"
 
-#define BDF_FILE "0:/eeg_8ch_250hz_10s.bdf"
+#define BDF_SPEED_TEST_FILE "0:/bdf_write_speed_100MiB.bdf"
 
 static void print_fresult(const char *operation, FRESULT result) {
     printf("%s failed: FatFs error %d\n", operation, (int)result);
@@ -36,13 +36,13 @@ int main(void) {
     }
 
     FATFS fs;
-    UINT bytes_written = 0;
+    bdf_write_stats_t stats;
     DSTATUS disk_state = disk_initialize(0);
     printf("SD init status: 0x%02x (0 means ready), SPI: %u Hz\n",
            disk_state, pico_fatfs_get_clk_fast_freq());
     FRESULT result = f_mount(&fs, "0:", 1);
     if (result == FR_OK) {
-        result = bdf_write_demo_file(BDF_FILE, &bytes_written);
+        result = bdf_write_speed_test_file(BDF_SPEED_TEST_FILE, &stats);
     }
 
     if (result != FR_OK) {
@@ -50,8 +50,22 @@ int main(void) {
         printf("Rebooting SD SPI: %s\n",
                pico_fatfs_reboot_spi() ? "card responded" : "no card response");
     } else {
-        printf("PASS: wrote %u-byte 8-channel, 250 Hz, 10 s BDF file: %s\n",
-               bytes_written, BDF_FILE);
+        uint64_t elapsed_ms = stats.elapsed_us / 1000u;
+        uint64_t bytes_per_second = stats.elapsed_us ? ((uint64_t)stats.actual_bytes * 1000000u) / stats.elapsed_us : 0u;
+        printf("BDF speed test complete: %s\n", BDF_SPEED_TEST_FILE);
+        printf("  requested size : %lu bytes (100 MiB)\n", (unsigned long)stats.target_bytes);
+        printf("  actual size    : %lu bytes\n", (unsigned long)stats.actual_bytes);
+        printf("  header/data    : %lu / %lu bytes\n", (unsigned long)stats.header_bytes,
+               (unsigned long)(stats.actual_bytes - stats.header_bytes));
+        printf("  data records   : %lu x %lu bytes\n", (unsigned long)stats.records,
+               (unsigned long)stats.record_bytes);
+        printf("  data writes    : %lu calls, up to %u bytes/call\n",
+               (unsigned long)stats.data_write_calls, 16u * stats.record_bytes);
+        printf("  elapsed time   : %llu.%03llu s\n", elapsed_ms / 1000u, elapsed_ms % 1000u);
+        printf("  write speed    : %llu B/s, %llu KiB/s, %llu.%03llu MiB/s\n",
+               bytes_per_second, bytes_per_second / 1024u,
+               bytes_per_second / (1024u * 1024u),
+               (bytes_per_second % (1024u * 1024u)) * 1000u / (1024u * 1024u));
     }
     f_unmount("0:");
 
