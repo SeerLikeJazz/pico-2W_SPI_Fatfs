@@ -19,16 +19,16 @@ int main(void) {
         printf("Pico 2 W starting BDF EEG writer (%d/5)\n", i + 1);
         sleep_ms(1000);
     }
-    puts("SD wiring: GP2=SCK, GP3=MOSI, GP4=MISO, GP5=CS, 3V3 and GND");
+    puts("SD wiring (SPI1): GP14=SCK, GP15=MOSI, GP12=MISO, GP13=CS, 3V3 and GND");
 
     pico_fatfs_spi_config_t config = {
-        .spi_inst = spi0,
+        .spi_inst = spi1,
         .clk_slow = CLK_SLOW_DEFAULT,
         .clk_fast = 30 * MHZ,
-        .pin_miso = PIN_SPI0_MISO_DEFAULT,
-        .pin_cs = PIN_SPI0_CS_DEFAULT,
-        .pin_sck = PIN_SPI0_SCK_DEFAULT,
-        .pin_mosi = PIN_SPI0_MOSI_DEFAULT,
+        .pin_miso = 12,
+        .pin_cs = 13,
+        .pin_sck = 14,
+        .pin_mosi = 15,
         .pullup = true,
     };
     if (!pico_fatfs_set_config(&config)) {
