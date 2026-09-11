@@ -16,6 +16,10 @@
 #ifndef ADS_SPI_HZ
 #define ADS_SPI_HZ 1000000u
 #endif
+/* Adaptive requests: base, 2x, 4x ... capped here; actual SDK rate rechecked. */
+#ifndef ADS_SPI_MAX_HZ
+#define ADS_SPI_MAX_HZ 8000000u
+#endif
 #ifndef ADS_DEFAULT_RATE
 #define ADS_DEFAULT_RATE 250u /* Nominal SPS at 2.048 MHz. */
 #endif

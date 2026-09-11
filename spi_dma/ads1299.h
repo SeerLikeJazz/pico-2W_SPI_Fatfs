@@ -38,6 +38,7 @@ void ads1299_power_on(void); /* Call before USB init. Inputs until rail settling
 bool ads1299_init(const ads1299_settings_t *settings);
 bool ads1299_reset(void); /* Leaves stopped and unconfigured. */
 bool ads1299_configure(const ads1299_settings_t *settings); /* Leaves stopped. */
+bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request);
 bool ads1299_start(void);
 bool ads1299_stop(void);
 void ads1299_poll(void); /* Watchdog + max two automatic recovery attempts. */

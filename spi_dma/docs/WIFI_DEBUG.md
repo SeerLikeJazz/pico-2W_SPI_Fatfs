@@ -25,6 +25,8 @@ python host/eeg_receiver.py --offline build/eeg.bin --csv build/eeg_offline.csv
 
 ## 配置与资源
 
+新增 USB 行命令 `:rate 250`～`:rate 16000`（仅七个合法档位）、`:gain 1`～`:gain 24`（仅七个合法倍数），详见 [USB 参数调试](USB_PARAMETERS.md)。它们复用停止/启动和网络采集代次机制，不通过 TCP 修改配置。
+
 | 文件/项 | 默认值和用途 |
 | --- | --- |
 | CMake ENABLE_WIFI_STREAM | ON；OFF 时不编译网络源，不启动 Core 1 |
@@ -105,7 +107,7 @@ powershell -ExecutionPolicy Bypass -File tests/run_tests.ps1
 
 产物：默认双核 `build/spi_dma.uf2`、`.elf`、`.elf.map`；单核 `build/no_wifi/spi_dma.uf2`、`.elf`、`.elf.map`。测试脚本可用 `-Python`、`-CC` 覆盖 Python 和 MinGW GCC 路径。
 
-2026-09-11 本机实际构建结果：SDK 2.2.0、pico2_w、Arm GCC 14.2.1；ON/OFF 均成功，维护源的 `-Wall -Wextra -Werror` 检查通过。`arm-none-eabi-size` 报告：
+2026-09-11 Wi-Fi 功能阶段的本机构建结果（后续 USB 动态参数修改的最新数值见 [USB 参数文档](USB_PARAMETERS.md)）：SDK 2.2.0、pico2_w、Arm GCC 14.2.1；ON/OFF 均成功，维护源的 `-Wall -Wextra -Werror` 检查通过。`arm-none-eabi-size` 报告：
 
 | 构建 | text | data | bss |
 | --- | ---: | ---: | ---: |

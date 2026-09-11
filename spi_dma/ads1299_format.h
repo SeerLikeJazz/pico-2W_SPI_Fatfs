@@ -19,4 +19,8 @@ bool ads1299_gain_code(unsigned gain, uint8_t *code);
 uint32_t ads1299_period_us(uint32_t mclk_hz, uint8_t rate_code);
 /* Conservative budget: 25% of period reserved for software and update window. */
 bool ads1299_spi_budget_ok(uint32_t mclk_hz, uint8_t rate_code, uint32_t spi_hz);
+/* Pure prediction of SDK 2.2.0 PL022 dividers, checked against SDK result at apply. */
+uint32_t ads1299_spi_actual(uint32_t peripheral_hz, uint32_t requested_hz);
+bool ads1299_spi_plan(uint32_t mclk, uint8_t code, uint32_t peripheral_hz,
+                      uint32_t base_hz, uint32_t max_hz, uint32_t *request);
 #endif

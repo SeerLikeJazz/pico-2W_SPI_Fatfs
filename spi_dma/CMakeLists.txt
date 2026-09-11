@@ -36,6 +36,8 @@ add_executable(spi_dma
         spi_dma.c
         ads1299.c
         ads1299_format.c
+        ads1299_control.c
+        usb_commands.c
         debug_console.c
         )
 target_include_directories(spi_dma PRIVATE ${CMAKE_CURRENT_LIST_DIR})
@@ -61,7 +63,7 @@ if(ENABLE_WIFI_STREAM)
 endif()
 
 # Strict checks on maintained application sources; leave vendored code flags alone.
-set_source_files_properties(spi_dma.c ads1299.c ads1299_format.c debug_console.c sd_legacy.c
+set_source_files_properties(spi_dma.c ads1299.c ads1299_format.c ads1299_control.c usb_commands.c debug_console.c sd_legacy.c
     net/eeg_stream.c net/wifi_stream.c net/dhcpserver.c
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 target_compile_definitions(spi_dma PRIVATE

@@ -7,9 +7,11 @@
 #include "hardware/irq.h"
 #include "hardware/spi.h"
 #include "hardware/sync.h"
+#include "hardware/clocks.h"
 
 _Static_assert(ADS_MCLK_HZ >= 100000u && ADS_MCLK_HZ <= 2500000u, "Check ADS external MCLK");
 _Static_assert(ADS_SPI_HZ > 0u && ADS_SPI_HZ <= 10000000u, "Conservative SPI limit for DVDD=3.3V");
+_Static_assert(ADS_SPI_MAX_HZ >= ADS_SPI_HZ && ADS_SPI_MAX_HZ <= 10000000u, "SPI request range");
 _Static_assert(ADS_QUEUE_CAPACITY >= 2u, "Queue too small");
 _Static_assert((ADS_QUEUE_CAPACITY & (ADS_QUEUE_CAPACITY - 1u)) == 0u, "Queue must be power of two for counter wrap");
 
@@ -30,6 +32,7 @@ static uint64_t power_enabled_us;
 static bool powered;
 static int rx_channel = -1, tx_channel = -1;
 static uint32_t dma_mask, transfer_us;
+static uint32_t spi_request_hz = ADS_SPI_HZ;
 static unsigned bad_streak, recovery_attempts;
 static const uint8_t nop = 0x00;
 static ads1299_state_callback_t state_callback;
@@ -53,7 +56,7 @@ static void cs_release(void) {
 }
 
 static void spi_setup(void) {
-    info.spi_hz = spi_init(spi0, ADS_SPI_HZ);
+    info.spi_hz = spi_init(spi0, spi_request_hz);
     spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     spi_get_hw(spi0)->icr = SPI_SSPICR_RORIC_BITS | SPI_SSPICR_RTIC_BITS;
 }
@@ -315,6 +318,7 @@ static bool abort_dma(void) {
            (dma_hw->abort & dma_mask)) {
         if (time_us_64() >= deadline) {
             info.fatal = true; /* Never reuse a buffer an unquiesced DMA may still write. */
+            info.configured = false;
             hw_clear_bits(&spi_get_hw(spi0)->dmacr,
                           SPI_SSPDMACR_TXDMAE_BITS | SPI_SSPDMACR_RXDMAE_BITS);
             return fail(ADS_ERR_ABORT);
@@ -383,16 +387,31 @@ bool ads1299_reset(void) {
     return true;
 }
 
-bool ads1299_configure(const ads1299_settings_t *settings) {
+bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request) {
     uint8_t rate, gain;
     if (!settings || !ads1299_rate_code(settings->nominal_sps, &rate) ||
         !ads1299_gain_code(settings->gain, &gain) ||
         (unsigned)settings->mode > ADS_MODE_NORMAL || (settings->srb1 && settings->srb2))
         return fail(ADS_ERR_ARGUMENT);
     if (!info.initialized || info.fatal) return fail(ADS_ERR_STATE);
-    if (!ads1299_spi_budget_ok(ADS_MCLK_HZ, rate, info.spi_hz)) return fail(ADS_ERR_SPI_BUDGET);
+    if (!ads1299_spi_plan(ADS_MCLK_HZ, rate, clock_get_hz(clk_peri), ADS_SPI_HZ,
+                         ADS_SPI_MAX_HZ, spi_request)) return fail(ADS_ERR_SPI_BUDGET);
+    return true;
+}
+
+bool ads1299_configure(const ads1299_settings_t *settings) {
+    uint32_t request;
+    if (!ads1299_preflight(settings, &request)) return false;
+    uint8_t rate = 0, gain = 0;
+    (void)ads1299_rate_code(settings->nominal_sps, &rate);
+    (void)ads1299_gain_code(settings->gain, &gain);
     if (info.running && !ads1299_stop()) return false;
     info.configured = false;
+    /* Fully stopped, DMA disabled, CS high. Preserve chosen rate through FIFO resets. */
+    spi_request_hz = request;
+    info.spi_hz = spi_set_baudrate(spi0, request);
+    if (info.spi_hz > ADS_SPI_MAX_HZ || !ads1299_spi_budget_ok(ADS_MCLK_HZ, rate, info.spi_hz))
+        return fail(ADS_ERR_SPI_BUDGET);
     if (!command(ADS_CMD_SDATAC)) return false;
     memset(info.expected, 0, sizeof info.expected);
     info.checked_mask = info.mismatch_mask = 0;

@@ -6,6 +6,10 @@ $ErrorActionPreference = 'Stop'
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
     New-Item -ItemType Directory -Force build | Out-Null
+    & $CC -std=c11 -O2 -Wall -Wextra -Werror -I . usb_commands.c ads1299_control.c ads1299_format.c net/eeg_stream.c tests/test_usb_controls.c -o build/test_usb_controls.exe
+    if ($LASTEXITCODE -ne 0) { throw 'USB control test compilation failed' }
+    & ./build/test_usb_controls.exe
+    if ($LASTEXITCODE -ne 0) { throw 'USB control tests failed' }
     & $CC -std=c11 -O2 -Wall -Wextra -Werror -I . net/eeg_stream.c tests/test_eeg_stream.c -o build/test_eeg_stream.exe
     if ($LASTEXITCODE -ne 0) { throw 'Stream C test compilation failed' }
     & ./build/test_eeg_stream.exe build/eeg_reference.bin

@@ -4,6 +4,8 @@
 #include "ads1299_config.h"
 #include "debug_console.h"
 #include "net/wifi_stream.h"
+#include "usb_commands.h"
+#include "ads1299_control.h"
 
 #if ENABLE_SD_CARD
 void sd_legacy_run(void);
@@ -16,10 +18,17 @@ static ads1299_settings_t settings = {
 static ads1299_frame_t latest;
 static bool have_sample;
 static bool sample_preview;
+static usb_command_parser_t command_parser;
+
+static void parameter_help(void) {
+    debug_log(":rate SPS [250 500 1000 2000 4000 8000 16000]; :gain N [1 2 4 6 8 12 24]. Enter to apply.\r\n");
+}
 
 static void help(void) {
     debug_log("Commands: ? help; s status; r registers (pause/resume); "
               "x stop; g start; i reset/retry; t test; h short; n normal; p preview25Hz on/off.\r\n");
+    parameter_help();
+    debug_log("Example :rate 1000<Enter>, :gain 24<Enter>. ':' required; RAM only; i retries RAM settings.\r\n");
 #if ENABLE_SD_CARD
     debug_log("b: legacy SD/BDF 100 MiB test with ADS stopped (manual resume).\r\n");
 #endif
@@ -29,17 +38,19 @@ static void report_config(void) {
     ads1299_info_t v;
     ads1299_get_info(&v);
     uint8_t rate = 6;
-    (void)ads1299_rate_code(settings.nominal_sps, &rate);
+    const ads1299_settings_t *current = v.configured ? &v.settings : &settings;
+    (void)ads1299_rate_code(current->nominal_sps, &rate);
     uint32_t actual_milli_sps = (uint32_t)((uint64_t)ADS_MCLK_HZ * 1000u / (128u << rate));
     debug_log("Pico2W ADS1299 SPI0 DMA; SD=%d UART=%d; 5V_EN(GP21)=%d\r\n",
               ENABLE_SD_CARD, ENABLE_UART_LOG, gpio_get(ADS_PIN_5V_EN));
     debug_log("Pins GP16=DOUT GP17=CS GP18=SCLK GP19=DIN GP20=DRDY GP21=5V_EN\r\n");
     debug_log("EXTERNAL MCLK=%u Hz ASSUMED: verify U12! CLKSEL=LOW. SPI actual=%" PRIu32 " Hz, mode1.\r\n",
               (unsigned)ADS_MCLK_HZ, v.spi_hz);
-    debug_log("Requested %u SPS nominal, calculated=%" PRIu32 ".%03" PRIu32 " SPS; "
+    debug_log("%s %u SPS nominal, calculated=%" PRIu32 ".%03" PRIu32 " SPS; "
               "gain=%u mode=%s test=fCLK/2^21; normal SRB1=%d SRB2=%d BIAS=%d\r\n",
-              settings.nominal_sps, actual_milli_sps / 1000u, actual_milli_sps % 1000u,
-              settings.gain, ads1299_mode_name(settings.mode), settings.srb1, settings.srb2, settings.bias);
+              v.configured ? "Verified" : "INVALID hardware config; RAM retry target:",
+              current->nominal_sps, actual_milli_sps / 1000u, actual_milli_sps % 1000u,
+              current->gain, ads1299_mode_name(current->mode), current->srb1, current->srb2, current->bias);
     debug_log("ID=0x%02x (8ch low5=0x1e; commonly 0x3e); init=%d configured=%d running=%d fatal=%d last=%s\r\n",
               v.id, v.initialized, v.configured, v.running, v.fatal, ads1299_error_name(v.last_error));
     for (unsigned a = 1; a < ADS_REG_COUNT; ++a) {
@@ -126,6 +137,40 @@ static void handle_command(int c) {
     }
 }
 
+static void handle_usb_input(void) {
+    for (unsigned i = 0; i < USB_COMMAND_CHARS_PER_POLL; ++i) {
+        int c = debug_console_getchar();
+        if (c < 0) break;
+        usb_command_t command = usb_command_feed(&command_parser, c);
+        if (command.kind == USB_CMD_NONE) continue;
+        if (command.kind == USB_CMD_LEGACY) { handle_command((int)command.value); break; }
+        if (command.kind == USB_CMD_ERROR) {
+            debug_log("Command FAILED: %s; acquisition unchanged.\r\n", command.error);
+            parameter_help(); break;
+        }
+        ads1299_info_t before, after;
+        ads1299_get_info(&before);
+        ads1299_change_t field = command.kind == USB_CMD_RATE ? ADS_CHANGE_RATE : ADS_CHANGE_GAIN;
+        unsigned old = field == ADS_CHANGE_RATE ? before.settings.nominal_sps : before.settings.gain;
+        ads1299_error_t error;
+        ads1299_change_result_t result = ads1299_change(&settings, field, command.value, &error);
+        ads1299_get_info(&after);
+        if (result != ADS_CHANGE_UNCHANGED && (!after.running || result == ADS_CHANGE_APPLIED)) have_sample = false;
+        debug_log("%s old=%u requested=%" PRIu32 ": %s; error=%s run=%d configured=%d\r\n",
+                  field == ADS_CHANGE_RATE ? "rate" : "gain", old, command.value,
+                  result == ADS_CHANGE_APPLIED ? "APPLIED" : result == ADS_CHANGE_UNCHANGED ? "UNCHANGED" : "FAILED",
+                  ads1299_error_name(error), after.running, after.configured);
+        report_config();
+        if (result == ADS_CHANGE_FAILED) {
+            if (error == ADS_ERR_SPI_BUDGET)
+                debug_log("SPI preflight/apply limit: MCLK=%u base=%u max=%u; require frame time <75%% period and valid MCLK.\r\n",
+                          (unsigned)ADS_MCLK_HZ, (unsigned)ADS_SPI_HZ, (unsigned)ADS_SPI_MAX_HZ);
+            parameter_help();
+        }
+        break; /* At most one command/configuration transaction per main-loop pass. */
+    }
+}
+
 int main(void) {
     ads1299_power_on(); /* GP21 goes HIGH before any USB initialization/wait. */
     (void)debug_console_init();
@@ -150,7 +195,7 @@ int main(void) {
         bool connected = debug_console_connected();
         if (connected && !was_connected) { report_config(); help(); }
         was_connected = connected;
-        handle_command(debug_console_getchar());
+        handle_usb_input();
         uint64_t now = time_us_64();
         if (sample_preview && have_sample && latest.sequence != preview_sequence && now - last_preview >= 40000u) {
             debug_log("sample,%" PRIu32 ",%" PRIu64 ",%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32

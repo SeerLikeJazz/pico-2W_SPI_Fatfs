@@ -43,3 +43,29 @@ bool ads1299_spi_budget_ok(uint32_t mclk, uint8_t code, uint32_t spi) {
     return (uint64_t)ADS_FRAME_BYTES * 8u * mclk * 4u <
            (uint64_t)(128u << code) * spi * 3u;
 }
+
+uint32_t ads1299_spi_actual(uint32_t peripheral, uint32_t request) {
+    if (!request || request > peripheral) return 0;
+    /* Same integer divider selection as SDK hardware_spi/spi.c spi_set_baudrate. */
+    uint32_t pre, post;
+    for (pre = 2; pre <= 254; pre += 2)
+        if (peripheral < (uint64_t)pre * 256u * request) break;
+    if (pre > 254) return 0;
+    for (post = 256; post > 1; --post)
+        if (peripheral / (pre * (post - 1)) > request) break;
+    return peripheral / (pre * post);
+}
+bool ads1299_spi_plan(uint32_t mclk, uint8_t code, uint32_t peripheral,
+                      uint32_t base, uint32_t maximum, uint32_t *request) {
+    /* ADS1299 Rev C table 7.6: tCLK=414..666 ns. Board SCLK cap <=10 MHz
+     * is conservative for both specified DVDD ranges (50/66.6 ns minimum). */
+    if (!request || !base || base > maximum || maximum > 10000000u || code > 6 ||
+        (uint64_t)mclk * 414u > 1000000000u || (uint64_t)mclk * 666u < 1000000000u) return false;
+    for (uint32_t hz = base;; hz = hz > maximum / 2u ? maximum : hz * 2u) {
+        uint32_t actual = ads1299_spi_actual(peripheral, hz);
+        if (actual && actual <= maximum && ads1299_spi_budget_ok(mclk, code, actual)) {
+            *request = hz; return true;
+        }
+        if (hz == maximum) return false;
+    }
+}
