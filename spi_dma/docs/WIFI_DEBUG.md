@@ -1,3 +1,7 @@
+# 当前版本：上电和连接均待机
+
+使用 [Code 上位机](../../Code/README.md) 显式开始/停止采集。以下命令行接收器已更新心跳，但不会发送 START；连接后可通过 USB g 手动启动。旧客户端不发送心跳会在五秒后断开。旧版无线测试数字仅为历史基线，本次验证见 Code/README.md。
+
 # Pico 2 W 双核 Wi-Fi 采集调试
 
 默认 Core 0 保持 ADS1299 SPI0 + DMA 采集和 USB 调试，Core 1 创建 `Pico2W_EEG` 热点、DHCP、单客户端 TCP 服务。每个从 ADS 本地队列取出的有效原始帧都提交网络队列，网络不使用 latest 或 25 Hz 预览作为数据源。SD、UART 默认 OFF，Wi-Fi 默认 ON。
@@ -21,11 +25,11 @@ python host/eeg_receiver.py --offline build/eeg.bin --csv build/eeg_offline.csv
 
 `--raw` 追加保存收到的所有 TCP 字节，包括错误候选包；`--csv` 新建/覆盖 CSV。不同输入/输出必须使用不同路径。CSV 包含连接编号、stream_id、包/采样序号、采样参数、状态和 ch1～ch8 原始码。timestamp_kind 为 recorded_irq 时是包首帧记录值，为 estimated 时是根据周期估算。可在 Excel、LibreOffice 或已有绘图软件导入 CSV，以 timestamp_us/1000000 为横轴、ch1～ch8 为纵轴查看波形；按连接和 stream_id 分段，不能跨缺口连线假装连续。高采样率下逐行 CSV 磁盘输出可能使接收程序变慢，优先保存二进制后离线解析。
 
-5. 保留现有 USB 命令，用 `s` 看采集和网络状态，`p` 预览仍独立控制；停止/启动、读寄存器、切模式的原命令见 ADS 文档。网络仅传数据，输入的 TCP 字节被确认并丢弃，不解释为采样命令。
+5. 保留现有 USB 命令，用 `s` 看采集和网络状态，`p` 预览仍独立控制；停止/启动、读寄存器、切模式的原命令见 ADS 文档。TCP 5000 传数据并接收每秒心跳；五秒无心跳即断线停采。TCP 5001 WFC2 支持查询、采样率、统一增益、四种模式和 START/STOP，详见 [上位机与控制协议](../../Code/README.md)。
 
 ## 配置与资源
 
-新增 USB 行命令 `:rate 250`～`:rate 16000`（仅七个合法档位）、`:gain 1`～`:gain 24`（仅七个合法倍数），详见 [USB 参数调试](USB_PARAMETERS.md)。它们复用停止/启动和网络采集代次机制，不通过 TCP 修改配置。
+新增 USB 行命令 `:rate 250`～`:rate 16000`（仅七个合法档位）、`:gain 1`～`:gain 24`（仅七个合法倍数），详见 [USB 参数调试](USB_PARAMETERS.md)。这些 USB 命令保留用于调试；上位机通过独立 TCP 5001 修改配置，不要同时从两端修改。
 
 | 文件/项 | 默认值和用途 |
 | --- | --- |
@@ -136,4 +140,4 @@ text 含 CYW43 固件只读镜像，不能视为 RAM 使用量。符号检查确
 - `host/eeg_receiver.py`、`tests/test_eeg_stream.c`、`tests/test_eeg_receiver.py`、`tests/run_tests.ps1`：接收、保存、自动化验证。
 - 本文、`PROTOCOL_V1.md`、`protocol_v1_example.hex`、主 ADS README：协议、步骤和兼容说明。
 
-外部参考工程未改动；SD/BDF 源码保留，未添加屏幕、HTTP、网络控制采样或板端数据存盘。
+外部参考工程未改动；SD/BDF 源码保留，未添加屏幕、HTTP 或板端数据存盘。Wi-Fi 参数控制扩展与上位机源码位于 `Code`，现已提供 WFC2 网络启停和四模式设置。

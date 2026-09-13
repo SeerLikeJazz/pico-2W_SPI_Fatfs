@@ -3,7 +3,7 @@
 #include "ads1299_format.h"
 #include "ads1299_registers.h"
 
-typedef enum { ADS_MODE_TEST, ADS_MODE_SHORT, ADS_MODE_NORMAL } ads1299_mode_t;
+typedef enum { ADS_MODE_TEST, ADS_MODE_SHORT, ADS_MODE_NORMAL, ADS_MODE_IMPEDANCE } ads1299_mode_t;
 typedef enum {
     ADS_OK, ADS_ERR_ARGUMENT, ADS_ERR_STATE, ADS_ERR_SPI_TIMEOUT,
     ADS_ERR_ID, ADS_ERR_READBACK, ADS_ERR_DMA_RESOURCE, ADS_ERR_SPI_BUDGET,

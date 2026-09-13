@@ -8,11 +8,13 @@ ads1299_change_result_t ads1299_change(ads1299_settings_t *ram, ads1299_change_t
     ads1299_settings_t requested = before.settings;
     if (field == ADS_CHANGE_RATE) requested.nominal_sps = value;
     else if (field == ADS_CHANGE_GAIN) requested.gain = value;
+    else if (field == ADS_CHANGE_MODE) requested.mode = (ads1299_mode_t)value;
     else { *error = ADS_ERR_ARGUMENT; return ADS_CHANGE_FAILED; }
     uint32_t target;
     if (!ads1299_preflight(&requested, &target)) goto failed;
     *ram = before.settings;
-    if (requested.nominal_sps == before.settings.nominal_sps && requested.gain == before.settings.gain) {
+    if (requested.nominal_sps == before.settings.nominal_sps && requested.gain == before.settings.gain &&
+        requested.mode == before.settings.mode) {
         *error = ADS_OK; return ADS_CHANGE_UNCHANGED;
     }
     /* configure performs preflight again and safely stops before register/SPI changes. */

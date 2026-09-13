@@ -1,4 +1,5 @@
 #include "wifi_stream.h"
+#include "wifi_control.h"
 #include "wifi_config.h"
 #include "eeg_stream.h"
 #include "dhcpserver.h"
@@ -22,7 +23,7 @@ static dhcp_server_t dhcp;
 static uint32_t stop_seen, no_client_drop, disconnect_queue_drop;
 static uint32_t connections, disconnects, rejected, enqueued, acked, backpressure, unacked_discard;
 static uint32_t conn_enqueued, conn_acked;
-static uint64_t last_progress;
+static uint64_t last_progress, last_heartbeat;
 static bool stop_pending;
 
 typedef struct {
@@ -45,6 +46,7 @@ static void publish(void) {
     atomic_store(&diag.unacked_discard, unacked_discard);
 }
 static void forget_connection(void) {
+    wifi_control_data_session(false, 0);
     ++disconnects;
     unacked_discard += conn_enqueued - conn_acked;
     eeg_stream_disconnect(&stream);
@@ -73,6 +75,7 @@ static void on_error(void *arg, err_t err) {
 static err_t on_receive(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     (void)arg;
     if (p) {
+        last_heartbeat = time_us_64();
         tcp_recved(pcb, p->tot_len);
         pbuf_free(p); /* No network control commands in V1. */
     }
@@ -100,6 +103,8 @@ static err_t on_accept(void *arg, struct tcp_pcb *pcb, err_t err) {
     stop_pending = false;
     client = pcb; conn_enqueued = conn_acked = 0;
     ++connections; last_progress = time_us_64();
+    last_heartbeat = last_progress;
+    wifi_control_data_session(true, lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&pcb->remote_ip))));
     atomic_store(&diag.client_ip, lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&pcb->remote_ip))));
     tcp_nagle_disable(pcb);
     tcp_arg(pcb, NULL); tcp_recv(pcb, on_receive); tcp_err(pcb, on_error);
@@ -120,6 +125,9 @@ static int write_copy(void *ctx, const uint8_t *data, size_t length) {
     return (int)length;
 }
 static void service_samples(void) {
+    if (client && time_us_64() - last_heartbeat > 5000000ull) {
+        (void)close_client(true); /* Missing host heartbeat: Core 0 stops ADC. */
+    }
     if (!client) {
         no_client_drop += eeg_queue_discard(&samples);
         (void)eeg_queue_stop_due(&samples, &stop_seen);
@@ -178,6 +186,10 @@ static bool start_ap(void) {
     listener = tcp_listen_with_backlog_and_err(pcb, 1, &err);
     if (!listener) { tcp_abort(pcb); goto failed; }
     tcp_accept(listener, on_accept);
+    if (!wifi_control_listen()) {
+        tcp_accept(listener, NULL); tcp_close(listener); listener = NULL;
+        goto failed;
+    }
     atomic_store(&diag.error, 0);
     return true;
 failed:
@@ -201,8 +213,10 @@ static void core1_main(void) {
         }
         if (up) {
             cyw43_arch_poll();
+            wifi_control_poll();
             if (!netif_is_up(&cyw43_state.netif[CYW43_ITF_AP])) {
                 (void)close_client(true);
+                wifi_control_shutdown();
                 tcp_accept(listener, NULL); (void)tcp_close(listener); listener = NULL;
                 dhcp_server_deinit(&dhcp);
                 cyw43_arch_disable_ap_mode(); cyw43_arch_deinit();
@@ -231,6 +245,7 @@ void wifi_stream_init(void) {
     ads1299_set_state_callback(acquisition_state);
 }
 void wifi_stream_launch(void) { multicore_launch_core1_with_stack(core1_main, wifi_core1_stack, sizeof wifi_core1_stack); }
+uint32_t wifi_stream_id(void) { return source.stream_id; }
 void wifi_stream_submit(const ads1299_frame_t *frame) {
     if (!source_running) return;
     source.sequence = frame->sequence; source.timestamp_us = frame->timestamp_us;

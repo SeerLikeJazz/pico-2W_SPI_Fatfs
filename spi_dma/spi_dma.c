@@ -4,6 +4,9 @@
 #include "ads1299_config.h"
 #include "debug_console.h"
 #include "net/wifi_stream.h"
+#if ENABLE_WIFI_STREAM
+#include "wifi_control.h"
+#endif
 #include "usb_commands.h"
 #include "ads1299_control.h"
 
@@ -106,7 +109,7 @@ static void handle_command(int c) {
     case 'g': report_result("start (use i if unconfigured)", ads1299_start()); break;
     case 'i':
         have_sample = false;
-        report_result("reset/config/start", ads1299_init(&settings) && ads1299_start());
+        report_result("reset/config (standby)", ads1299_init(&settings));
         report_config();
         break;
     case 'r': {
@@ -122,8 +125,8 @@ static void handle_command(int c) {
         ads1299_settings_t requested = settings;
         requested.mode = c == 't' ? ADS_MODE_TEST : c == 'h' ? ADS_MODE_SHORT : ADS_MODE_NORMAL;
         bool ok = ads1299_configure(&requested);
-        if (ok) { settings = requested; have_sample = false; ok = ads1299_start(); }
-        report_result("mode/config/start", ok);
+        if (ok) { settings = requested; have_sample = false; }
+        report_result("mode/config (standby)", ok);
         report_config();
         break;
     }
@@ -175,7 +178,7 @@ int main(void) {
     ads1299_power_on(); /* GP21 goes HIGH before any USB initialization/wait. */
     (void)debug_console_init();
     wifi_stream_init();
-    bool ok = ads1299_init(&settings) && ads1299_start();
+    bool ok = ads1299_init(&settings); /* Explicit user START required. */
     wifi_stream_launch();
     report_result("startup", ok);
     report_config();
@@ -196,6 +199,9 @@ int main(void) {
         if (connected && !was_connected) { report_config(); help(); }
         was_connected = connected;
         handle_usb_input();
+#if ENABLE_WIFI_STREAM
+        wifi_control_apply(&settings);
+#endif
         uint64_t now = time_us_64();
         if (sample_preview && have_sample && latest.sequence != preview_sequence && now - last_preview >= 40000u) {
             debug_log("sample,%" PRIu32 ",%" PRIu64 ",%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32

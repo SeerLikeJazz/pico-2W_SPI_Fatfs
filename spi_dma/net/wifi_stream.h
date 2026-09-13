@@ -10,6 +10,7 @@ void wifi_stream_init(void); /* Core 0, before ADS init: queue and state hook. *
 void wifi_stream_launch(void); /* Core 0, after ADS resources have been claimed. */
 void wifi_stream_submit(const ads1299_frame_t *frame);
 void wifi_stream_report(void); /* Core 0 only; logs atomic diagnostic snapshots. */
+uint32_t wifi_stream_id(void); /* Core 0: last/current acquisition generation. */
 #else
 static inline void wifi_stream_init(void) {}
 static inline void wifi_stream_launch(void) {}

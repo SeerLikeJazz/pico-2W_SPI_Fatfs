@@ -56,7 +56,7 @@ class StreamDecoder:
     def valid_header(h):
         return (h[0] == MAGIC and h[1] == 1 and h[2] == 1 and h[4] == 1024 and h[5] == 44
                 and 1 <= h[6] <= 36 and h[7] == 27 and h[11] > 0
-                and h[12] in RATES and h[13] in GAINS and h[14] in (0, 1, 2)
+                and h[12] in RATES and h[13] in GAINS and h[14] in (0, 1, 2, 3)
                 and bool(h[3] & 1) == (h[6] < 36))
 
     def feed(self, data):
@@ -192,7 +192,10 @@ def main():
                         tracking.previous = None  # Cannot infer loss across reconnect/reboot.
                         print(f"Connected #{connection}: {args.host}:{args.port}")
                         sock.settimeout(1)
+                        heartbeat = 0
                         while time.monotonic() < deadline:
+                            if time.monotonic() - heartbeat >= 1:
+                                sock.sendall(b'K'); heartbeat = time.monotonic()
                             try:
                                 data = sock.recv(8192)
                                 if not data:

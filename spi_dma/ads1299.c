@@ -1,3 +1,4 @@
+#include "../Code/firmware/ads_mode_registers.h"
 #include "ads1299.h"
 #include "ads1299_config.h"
 
@@ -391,7 +392,7 @@ bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request
     uint8_t rate, gain;
     if (!settings || !ads1299_rate_code(settings->nominal_sps, &rate) ||
         !ads1299_gain_code(settings->gain, &gain) ||
-        (unsigned)settings->mode > ADS_MODE_NORMAL || (settings->srb1 && settings->srb2))
+        (unsigned)settings->mode > ADS_MODE_IMPEDANCE || (settings->srb1 && settings->srb2))
         return fail(ADS_ERR_ARGUMENT);
     if (!info.initialized || info.fatal) return fail(ADS_ERR_STATE);
     if (!ads1299_spi_plan(ADS_MCLK_HZ, rate, clock_get_hz(clk_peri), ADS_SPI_HZ,
@@ -417,23 +418,7 @@ bool ads1299_configure(const ads1299_settings_t *settings) {
     info.checked_mask = info.mismatch_mask = 0;
     /* Reserved bits preserved, DAISY_EN=1 for a standalone chip, CLK_EN=0. */
     info.expected[ADS_REG_CONFIG1] = ADS_CONFIG1_RESERVED | ADS_CONFIG1_MULTIPLE_READBACK | rate;
-    info.expected[ADS_REG_CONFIG2] = ADS_CONFIG2_RESERVED |
-        (settings->mode == ADS_MODE_TEST ? ADS_CONFIG2_INT_CAL : 0);
-    info.expected[ADS_REG_CONFIG3] = ADS_CONFIG3_RESERVED | ADS_CONFIG3_REF_ON | ADS_CONFIG3_BIASREF_INT;
-    uint8_t mux = settings->mode == ADS_MODE_TEST ? ADS_MUX_TEST :
-                  settings->mode == ADS_MODE_SHORT ? ADS_MUX_SHORT : ADS_MUX_NORMAL;
-    for (unsigned i = ADS_REG_CH1SET; i <= ADS_REG_CH8SET; ++i)
-        info.expected[i] = (uint8_t)((gain << 4) | mux |
-            (settings->mode == ADS_MODE_NORMAL && settings->srb2 ? ADS_CH_SRB2 : 0));
-    if (settings->mode == ADS_MODE_NORMAL) {
-        if (settings->srb1) info.expected[ADS_REG_MISC1] = ADS_MISC1_SRB1;
-        if (settings->bias) {
-            info.expected[ADS_REG_CONFIG3] |= ADS_CONFIG3_BIAS_ON;
-            info.expected[ADS_REG_BIAS_SENSP] = ADS_BIAS_SENSP_MASK;
-            info.expected[ADS_REG_BIAS_SENSN] = ADS_BIAS_SENSN_MASK;
-        }
-    }
-    /* LOFF sensing disabled, GPIO all inputs, CONFIG4 continuous conversion. */
+    ads_mode_registers(info.expected, settings, gain);
     info.expected[ADS_REG_GPIO] = 0x0f;
     for (uint8_t a = ADS_REG_CONFIG1; a < ADS_REG_COUNT; ++a) {
         if (a == ADS_REG_LOFF_STATP || a == ADS_REG_LOFF_STATN) continue;
@@ -564,6 +549,7 @@ const char *ads1299_mode_name(ads1299_mode_t mode) {
     case ADS_MODE_TEST: return "internal-test";
     case ADS_MODE_SHORT: return "internal-short";
     case ADS_MODE_NORMAL: return "normal-differential";
+    case ADS_MODE_IMPEDANCE: return "impedance-ac-raw";
     default: return "invalid";
     }
 }
