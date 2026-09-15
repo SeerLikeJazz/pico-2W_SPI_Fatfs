@@ -280,8 +280,8 @@ class Window(QMainWindow):
                     self.control_label.setText('待执行操作已取消：设备已不处于待机状态。')
                 else:
                     self.send_control(op, value)
-            elif self.query_needed or (self.synced and time.monotonic() >= self.next_query):
-                background = self.synced and not self.query_needed
+            elif self.query_needed:
+                background = False  # Initial/error recovery sync only; no periodic 5001 query.
                 self.query_needed = False; self.send_control(0, 0, background=background)
         if self.displaying: self.plot.update()
         if self.closing and not active and not self.busy(): self.close()

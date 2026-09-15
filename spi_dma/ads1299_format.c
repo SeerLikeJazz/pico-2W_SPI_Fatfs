@@ -57,9 +57,9 @@ uint32_t ads1299_spi_actual(uint32_t peripheral, uint32_t request) {
 }
 bool ads1299_spi_plan(uint32_t mclk, uint8_t code, uint32_t peripheral,
                       uint32_t base, uint32_t maximum, uint32_t *request) {
-    /* ADS1299 Rev C table 7.6: tCLK=414..666 ns. Board SCLK cap <=10 MHz
-     * is conservative for both specified DVDD ranges (50/66.6 ns minimum). */
-    if (!request || !base || base > maximum || maximum > 10000000u || code > 6 ||
+    /* ADS1299 Rev C table 7.6: tCLK=414..666 ns. SCLK <=20 MHz
+     * requires DVDD=2.7..3.6 V. Firmware requests fixed 15 MHz. */
+    if (!request || !base || base > maximum || maximum > 20000000u || code > 6 ||
         (uint64_t)mclk * 414u > 1000000000u || (uint64_t)mclk * 666u < 1000000000u) return false;
     for (uint32_t hz = base;; hz = hz > maximum / 2u ? maximum : hz * 2u) {
         uint32_t actual = ads1299_spi_actual(peripheral, hz);

@@ -2,7 +2,6 @@
 """EEG1 decoder and continuity tracking, reused from spi_dma/host/eeg_receiver.py."""
 from dataclasses import dataclass
 import struct
-import zlib
 
 MAGIC = b"EEG1"
 TAIL = b"\x0d\x0a\xa5\x5a"
@@ -44,12 +43,12 @@ class Packet:
 class StreamDecoder:
     def __init__(self):
         self.buffer = bytearray()
-        self.crc_errors = self.header_errors = self.tail_errors = self.padding_errors = 0
+        self.header_errors = self.tail_errors = self.padding_errors = 0
         self.discarded_bytes = 0
 
     @staticmethod
     def valid_header(h):
-        return (h[0] == MAGIC and h[1] == 1 and h[2] == 1 and h[4] == 1024 and h[5] == 44
+        return (h[0] == MAGIC and h[1] == 2 and h[2] == 1 and h[4] == 1024 and h[5] == 44
                 and 1 <= h[6] <= 36 and h[7] == 27 and h[11] > 0
                 and h[12] in RATES and h[13] in GAINS and h[14] in (0, 1, 2, 3)
                 and bool(h[3] & 1) == (h[6] < 36))
@@ -76,9 +75,7 @@ class StreamDecoder:
                 break
             elif self.buffer[1020:1024] != TAIL:
                 self.tail_errors += 1
-            elif zlib.crc32(self.buffer[:1016]) != struct.unpack_from("<I", self.buffer, 1016)[0]:
-                self.crc_errors += 1
-            elif any(self.buffer[44+27*h[6]:1016]):
+            elif any(self.buffer[44+27*h[6]:1020]):
                 self.padding_errors += 1
             else:
                 raw = bytes(self.buffer[:1024])

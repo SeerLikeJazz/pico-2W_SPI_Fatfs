@@ -101,7 +101,11 @@ static void spi_tests(void) {
     assert(!ads1299_spi_plan(2500000,0,150000000,1000000,8000000,&request));
     assert(!ads1299_spi_plan(2048000,7,150000000,1000000,8000000,&request));
     assert(!ads1299_spi_plan(2048000,0,150000000,0,8000000,&request));
-    assert(!ads1299_spi_plan(2048000,0,150000000,1000000,20000000,&request));
+    assert(!ads1299_spi_plan(2048000,0,150000000,1000000,20000001,&request));
+    for (uint8_t code=0;code<7;code++) {
+        assert(ads1299_spi_plan(2048000,code,150000000,15000000,15000000,&request));
+        assert(request==15000000 && ads1299_spi_actual(150000000,request)==15000000);
+    }
     assert(ads1299_spi_actual(150000000,8000000)==7500000);
     assert(ads1299_spi_actual(150000000,1)==0);
     assert(!ads1299_spi_budget_ok(2048000,0,4608000)); /* exactly 75% forbidden */

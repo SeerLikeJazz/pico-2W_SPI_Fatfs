@@ -9,7 +9,8 @@
 #define EEG_HEADER_SIZE 44u
 #define EEG_SAMPLE_SIZE 27u
 #define EEG_SAMPLES_PER_PACKET 36u
-#define EEG_CRC_OFFSET 1016u
+#define EEG_RESERVED_OFFSET 1016u
+#define EEG_TAIL_OFFSET 1020u
 #ifndef EEG_QUEUE_CAPACITY
 #define EEG_QUEUE_CAPACITY 512u
 #endif
@@ -38,9 +39,15 @@ uint32_t eeg_queue_discard(eeg_queue_t *q); /* Consumer only; bounded snapshot. 
 void eeg_queue_stop(eeg_queue_t *q); /* Producer only, cannot fail when full. */
 bool eeg_queue_stop_due(eeg_queue_t *q, uint32_t *observed_serial);
 
-uint32_t eeg_crc32(const void *data, size_t length);
+/* Consumer borrows contiguous slots until consume; cap at an unseen STOP. */
+unsigned eeg_queue_read_batch(eeg_queue_t *q, const eeg_sample_t **items,
+                             unsigned maximum, uint32_t stop_seen);
+void eeg_queue_consume(eeg_queue_t *q, unsigned count);
+eeg_sample_t *eeg_queue_reserve(eeg_queue_t *q);
+void eeg_queue_commit(eeg_queue_t *q);
 typedef struct {
-    uint8_t building[EEG_PACKET_SIZE], pending[EEG_PACKET_SIZE];
+    uint8_t buffers[2][EEG_PACKET_SIZE];
+    uint8_t *building, *pending; /* Non-copyable after init: pointers own buffers. */
     eeg_sample_t first;
     uint64_t began_us;
     uint32_t stream_id, next_packet, expected_sample;

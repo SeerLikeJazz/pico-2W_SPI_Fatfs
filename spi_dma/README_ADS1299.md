@@ -1,3 +1,5 @@
+> 2026-09-14 优化更新：所有采样率固定 15 MHz SPI（校验实际分频），固件仅传 raw、关闭预览和解码；EEG1 数据版本为 2，无 CRC；上位机关闭 5001 每 2 秒周期查询。以下历史说明中与此冲突的自适应 SPI、预览及 CRC 描述已被替代。详细变更与实测步骤见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，当前协议见 [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md)。
+
 # Pico 2 W / 单片 ADS1299 调试说明
 
 本工程默认上电打开 ADS1299 电源，用 SPI0 + RX/TX DMA 采集 8 通道，USB CDC 输出诊断信息。默认 **内部测试配置、增益 1、250 SPS（以 2.048 MHz MCLK 为前提），上电待机**，需要上位机“开始显示”或 USB g 显式启动。SD、UART 日志、25 Hz 抽样预览默认关闭。新增 Core 1 Wi-Fi 热点和 TCP 数据流默认开启，见 [Wi-Fi 调试说明](docs/WIFI_DEBUG.md) 和 [协议 V1](docs/PROTOCOL_V1.md)；`ENABLE_WIFI_STREAM=OFF` 可恢复单核采集构建。没有加入屏幕或板端数据存盘。

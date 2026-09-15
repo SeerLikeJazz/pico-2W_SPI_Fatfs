@@ -58,6 +58,9 @@ int debug_console_getchar(void) {
 }
 
 void debug_log(const char *format, ...) {
+#if !ENABLE_UART_LOG
+    if (!debug_console_connected()) { ++dropped; return; }
+#endif
     char line[768];
     va_list args;
     va_start(args, format);

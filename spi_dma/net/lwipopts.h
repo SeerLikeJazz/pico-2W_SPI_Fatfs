@@ -22,7 +22,11 @@
 #define PBUF_POOL_SIZE 16
 #define PBUF_POOL_BUFSIZE 1536
 #define TCP_MSS 1460
-#define TCP_SND_BUF (8 * TCP_MSS)
+/* Tune only from measured ACK delay and queue age; override at build time. */
+#ifndef EEG_TCP_SND_MSS
+#define EEG_TCP_SND_MSS 8
+#endif
+#define TCP_SND_BUF (EEG_TCP_SND_MSS * TCP_MSS)
 #define TCP_WND (4 * TCP_MSS)
 #define TCP_SND_QUEUELEN 64
 #define LWIP_TCP_KEEPALIVE 1

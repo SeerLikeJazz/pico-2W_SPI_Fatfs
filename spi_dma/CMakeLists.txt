@@ -31,6 +31,10 @@ pico_sdk_init()
 option(ENABLE_SD_CARD "Build manually triggered legacy SD/BDF test" OFF)
 option(ENABLE_UART_LOG "Mirror logs on UART0 TX GP0 (conflicts with screen)" OFF)
 option(ENABLE_WIFI_STREAM "Core 1 AP and EEG TCP streaming" ON)
+set(EEG_TCP_SND_MSS 8 CACHE STRING "TCP send buffer in MSS units; tune from measured ACK delay")
+if(NOT EEG_TCP_SND_MSS MATCHES "^[0-9]+$" OR EEG_TCP_SND_MSS LESS 1 OR EEG_TCP_SND_MSS GREATER 16)
+    message(FATAL_ERROR "EEG_TCP_SND_MSS must be between 1 and 16")
+endif()
 
 add_executable(spi_dma
         spi_dma.c
@@ -61,7 +65,7 @@ if(ENABLE_WIFI_STREAM)
     target_sources(spi_dma PRIVATE net/eeg_stream.c net/wifi_stream.c net/dhcpserver.c)
     target_include_directories(spi_dma PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/net)
     target_link_libraries(spi_dma pico_multicore pico_rand pico_cyw43_arch_lwip_poll)
-    target_compile_definitions(spi_dma PRIVATE PICO_CYW43_LOGGING_ENABLED=0)
+    target_compile_definitions(spi_dma PRIVATE PICO_CYW43_LOGGING_ENABLED=0 EEG_TCP_SND_MSS=${EEG_TCP_SND_MSS})
     pico_configure_ip4_address(spi_dma PRIVATE CYW43_DEFAULT_IP_AP_ADDRESS 192.168.4.1)
 endif()
 

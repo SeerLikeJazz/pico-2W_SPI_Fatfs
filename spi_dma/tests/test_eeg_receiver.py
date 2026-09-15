@@ -5,7 +5,6 @@ import unittest
 from unittest.mock import patch, MagicMock
 import io
 import tempfile
-import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "host"))
@@ -13,8 +12,8 @@ from eeg_receiver import StreamDecoder, Continuity, HEADER
 import eeg_receiver
 
 
-def fix_crc(packet):
-    struct.pack_into("<I", packet, 1016, zlib.crc32(packet[:1016]))
+def wire_bytes(packet):
+    # V2 has no payload checksum.
     return bytes(packet)
 
 
@@ -48,11 +47,11 @@ class ProtocolTests(unittest.TestCase):
         modified = bytearray(self.raw)
         modified[80:84] = b"EEG1"
         modified[90:94] = b"\r\n\xa5\x5a"
-        modified = fix_crc(modified)
+        modified = wire_bytes(modified)
         self.assertEqual(len(StreamDecoder().feed(self.raw + modified + self.raw)), 3)
 
     def test_corruption_resync(self):
-        for offset in (4, 5, 8, 10, 12, 14, 200, 1016, 1020):
+        for offset in (4, 5, 8, 10, 12, 14, 1016, 1020):
             corrupt = bytearray(self.raw)
             corrupt[offset] ^= 0x80
             d = StreamDecoder()
@@ -60,15 +59,21 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(len(result), 1, offset)
             self.assertGreater(d.discarded_bytes, 0)
 
+    def test_payload_is_raw_without_crc_and_v1_rejected(self):
+        raw = bytearray(self.raw); raw[200] ^= 0x80
+        self.assertEqual(len(StreamDecoder().feed(raw)), 1)
+        raw[4] = 1
+        self.assertFalse(StreamDecoder().feed(raw))
+
     def test_partial_and_zero_padding(self):
         data = bytearray(self.raw)
         struct.pack_into("<H", data, 6, 11)
         struct.pack_into("<H", data, 12, 1)
         data[71:1016] = bytes(945)
-        self.assertEqual(StreamDecoder().feed(fix_crc(data))[0].count, 1)
+        self.assertEqual(StreamDecoder().feed(wire_bytes(data))[0].count, 1)
         data[71] = 1
         d = StreamDecoder()
-        self.assertFalse(d.feed(fix_crc(data)))
+        self.assertFalse(d.feed(wire_bytes(data)))
         self.assertEqual(d.padding_errors, 1)
 
     def test_wrap_and_gaps(self):
@@ -76,17 +81,17 @@ class ProtocolTests(unittest.TestCase):
         p = bytearray(self.raw)
         struct.pack_into("<I", p, 16, 0xffffffff)
         struct.pack_into("<I", p, 20, 0xfffffff0)
-        tracking.accept(d.feed(fix_crc(p))[0])
+        tracking.accept(d.feed(wire_bytes(p))[0])
         struct.pack_into("<I", p, 16, 0)
         struct.pack_into("<I", p, 20, 20)
-        tracking.accept(d.feed(fix_crc(p))[0])
+        tracking.accept(d.feed(wire_bytes(p))[0])
         self.assertEqual((tracking.packet_gaps, tracking.sample_gaps), (0, 0))
         struct.pack_into("<I", p, 16, 2)
         struct.pack_into("<I", p, 20, 60)
-        tracking.accept(d.feed(fix_crc(p))[0])
+        tracking.accept(d.feed(wire_bytes(p))[0])
         self.assertEqual((tracking.packet_gaps, tracking.sample_gaps), (1, 4))
         struct.pack_into("<I", p, 40, 999)
-        tracking.accept(d.feed(fix_crc(p))[0])
+        tracking.accept(d.feed(wire_bytes(p))[0])
         self.assertEqual(tracking.reorders, 0)
 
     def test_receiver_reconnect_discards_partial(self):

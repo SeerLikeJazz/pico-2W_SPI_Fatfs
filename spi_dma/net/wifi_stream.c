@@ -11,6 +11,9 @@
 #include "pico/rand.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/tcp.h"
+#include "hardware/timer.h"
+#include "hardware/sync.h"
+#include "perf.h"
 
 static eeg_queue_t samples;
 static eeg_sample_t source; /* Core 0 only, changed by ADS lifecycle hook. */
@@ -24,9 +27,17 @@ static uint32_t stop_seen, no_client_drop, disconnect_queue_drop;
 static uint32_t connections, disconnects, rejected, enqueued, acked, backpressure, unacked_discard;
 static uint32_t conn_enqueued, conn_acked;
 static uint64_t last_progress, last_heartbeat;
-static bool stop_pending;
+static bool stop_pending, output_pending;
+static perf_counter_t network_time, service_time;
+static uint32_t queue_age_max_us, inflight_max, ack_delay_max_us;
+static uint32_t probe_end, probe_started;
+static bool probe_active;
+static int idle_alarm;
+static void idle_alarm_callback(uint alarm_num) { (void)alarm_num; __sev(); }
 
 typedef struct {
+    _Atomic uint32_t network_avg_us, network_max_us, service_avg_us, service_max_us;
+    _Atomic uint32_t queue_age_max_us, inflight_max, ack_delay_max_us;
     _Atomic uint32_t ap_state, attempt, connected, client_ip, error;
     _Atomic uint32_t no_client, disconnect_queue, packets, partial, discarded_packets, discarded_samples;
     _Atomic uint32_t connections, disconnects, rejected, enqueued, acked, backpressure, unacked_discard;
@@ -34,6 +45,13 @@ typedef struct {
 static diagnostics_t diag;
 /* Approximate per-field snapshot; diagnostic counters wrap modulo 2^32. */
 static void publish(void) {
+    atomic_store(&diag.network_avg_us, network_time.count ? network_time.total_us/network_time.count : 0);
+    atomic_store(&diag.network_max_us, network_time.max_us);
+    atomic_store(&diag.service_avg_us, service_time.count ? service_time.total_us/service_time.count : 0);
+    atomic_store(&diag.service_max_us, service_time.max_us);
+    atomic_store(&diag.queue_age_max_us, queue_age_max_us);
+    atomic_store(&diag.inflight_max, inflight_max);
+    atomic_store(&diag.ack_delay_max_us, ack_delay_max_us);
     atomic_store(&diag.connected, client != NULL);
     atomic_store(&diag.no_client, no_client_drop);
     atomic_store(&diag.disconnect_queue, disconnect_queue_drop);
@@ -51,7 +69,7 @@ static void forget_connection(void) {
     unacked_discard += conn_enqueued - conn_acked;
     eeg_stream_disconnect(&stream);
     disconnect_queue_drop += eeg_queue_discard(&samples);
-    stop_pending = false;
+    stop_pending = output_pending = probe_active = false;
     client = NULL;
     atomic_store(&diag.client_ip, 0);
 }
@@ -86,6 +104,11 @@ static err_t on_receive(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t er
 static err_t on_sent(void *arg, struct tcp_pcb *pcb, u16_t length) {
     (void)arg; (void)pcb;
     acked += length; conn_acked += length;
+    if (probe_active && (uint32_t)(conn_acked - probe_end) < 0x80000000u) {
+        uint32_t delay = time_us_32() - probe_started;
+        if (delay > ack_delay_max_us) ack_delay_max_us = delay;
+        probe_active = false;
+    }
     last_progress = time_us_64();
     return ERR_OK;
 }
@@ -121,44 +144,82 @@ static int write_copy(void *ctx, const uint8_t *data, size_t length) {
     if (err == ERR_MEM) { ++backpressure; return 0; }
     if (err != ERR_OK) { atomic_store(&diag.error, (uint32_t)(int32_t)err); return -1; }
     enqueued += (uint32_t)length; conn_enqueued += (uint32_t)length;
+    output_pending = true;
+    uint32_t inflight = conn_enqueued - conn_acked;
+    if (inflight > inflight_max) inflight_max = inflight;
+    if (!probe_active) {
+        probe_end = conn_enqueued; probe_started = time_us_32(); probe_active = true;
+    }
     last_progress = time_us_64();
     return (int)length;
 }
-static void service_samples(void) {
-    if (client && time_us_64() - last_heartbeat > 5000000ull) {
-        (void)close_client(true); /* Missing host heartbeat: Core 0 stops ADC. */
-    }
+/* Bounded work: at most 64 samples / 4 TCP writes / roughly 200 us per pass.
+ * A single lwIP call can exceed the time budget; network poll runs next. */
+static bool service_samples(void) {
+    uint64_t started = time_us_64();
+    if (client && started - last_heartbeat > 5000000ull) (void)close_client(true);
     if (!client) {
         no_client_drop += eeg_queue_discard(&samples);
         (void)eeg_queue_stop_due(&samples, &stop_seen);
         stop_pending = false;
-        return;
+        return false;
     }
-    if (eeg_stream_pump(&stream, write_copy, NULL) < 0) { (void)close_client(true); return; }
-    for (unsigned i = 0; i < 64u; ++i) {
+    unsigned consumed = 0, writes = 0;
+    bool progressed = false, blocked = false;
+    while (consumed < 64u && time_us_64() - started < 200u) {
+        if (stream.ready) {
+            if (writes == 4u) break;
+            ++writes;
+            int n = eeg_stream_pump(&stream, write_copy, NULL);
+            if (n < 0) { (void)close_client(true); return false; }
+            if (n == 0) { blocked = true; break; }
+            progressed = true;
+        }
         if (eeg_queue_stop_due(&samples, &stop_seen)) stop_pending = true;
         if (stop_pending) {
             if (!eeg_stream_flush(&stream)) break;
             stop_pending = false;
+            if (stream.ready) continue;
         }
-        eeg_sample_t v;
-        if (!eeg_queue_peek(&samples, &v)) break;
-        if (!eeg_stream_offer(&stream, &v, time_us_64())) break;
-        eeg_queue_pop(&samples);
+        const eeg_sample_t *batch;
+        unsigned count = eeg_queue_read_batch(&samples, &batch, 64u - consumed, stop_seen);
+        if (!count) break;
+        unsigned used = 0;
+        for (; used < count; ++used) {
+            uint64_t now = time_us_64();
+            if (now - started >= 200u) break;
+            if (!eeg_stream_offer(&stream, &batch[used], now)) break;
+            uint64_t age = now - batch[used].timestamp_us;
+            uint32_t age32 = age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
+            if (age32 > queue_age_max_us) queue_age_max_us = age32;
+            if (stream.ready) { ++used; break; }
+        }
+        eeg_queue_consume(&samples, used);
+        consumed += used; progressed |= used != 0;
+        if (!used) break;
     }
     eeg_stream_tick(&stream, time_us_64());
-    /* tcp_output failure does NOT roll back the copy offset. */
-    err_t err = tcp_output(client);
-    if (err != ERR_OK && err != ERR_MEM && err != ERR_BUF) {
-        atomic_store(&diag.error, (uint32_t)(int32_t)err);
-        (void)close_client(true); return;
+    /* Send newly completed/timeout-flushed packets in this same pass. */
+    if (stream.ready && writes < 4u && !blocked) {
+        int n = eeg_stream_pump(&stream, write_copy, NULL);
+        if (n < 0) { (void)close_client(true); return false; }
+        progressed |= n > 0; blocked = n == 0;
+    }
+    if (output_pending) {
+        err_t err = tcp_output(client);
+        if (err == ERR_OK) output_pending = false;
+        else if (err != ERR_MEM && err != ERR_BUF) {
+            atomic_store(&diag.error, (uint32_t)(int32_t)err);
+            (void)close_client(true); return false;
+        }
     }
     bool work = stream.ready || stream.count || conn_enqueued != conn_acked;
     if (!work) last_progress = time_us_64();
     else if (time_us_64() - last_progress > EEG_NO_PROGRESS_US) {
         atomic_store(&diag.error, 1004u);
-        (void)close_client(true);
+        (void)close_client(true); return false;
     }
+    return progressed && !blocked;
 }
 static bool start_ap(void) {
     size_t password_len = strlen(EEG_AP_PASSWORD);
@@ -200,6 +261,8 @@ failed:
 }
 static void core1_main(void) {
     eeg_stream_init(&stream);
+    idle_alarm = hardware_alarm_claim_unused(true);
+    hardware_alarm_set_callback((uint)idle_alarm, idle_alarm_callback);
     bool up = false;
     uint32_t attempts = 0;
     uint64_t retry_at = 0, next_report = 0;
@@ -212,7 +275,9 @@ static void core1_main(void) {
             retry_at = time_us_64() + EEG_AP_RETRY_US;
         }
         if (up) {
+            uint32_t began = time_us_32();
             cyw43_arch_poll();
+            perf_add(&network_time, time_us_32() - began);
             wifi_control_poll();
             if (!netif_is_up(&cyw43_state.netif[CYW43_ITF_AP])) {
                 (void)close_client(true);
@@ -225,10 +290,16 @@ static void core1_main(void) {
                 retry_at = time_us_64() + EEG_AP_RETRY_US;
             }
         }
-        service_samples();
+        uint32_t began = time_us_32();
+        bool progressed = service_samples();
+        perf_add(&service_time, time_us_32() - began);
         if (now >= next_report) { publish(); next_report = now + 100000u; }
-        /* Core-local wait; does not use Core 0's default alarm pool. */
-        busy_wait_us_32(250);
+        /* No delay while productive. A Core 1 alarm bounds idle/backpressure
+         * WFE; producer SEV wakes an empty queue without using Core 0's pool. */
+        if (!progressed) {
+            if (!hardware_alarm_set_target((uint)idle_alarm, make_timeout_time_us(250))) __wfe();
+            hardware_alarm_cancel((uint)idle_alarm);
+        }
     }
 }
 static void acquisition_state(bool running, const ads1299_settings_t *settings) {
@@ -248,11 +319,22 @@ void wifi_stream_launch(void) { multicore_launch_core1_with_stack(core1_main, wi
 uint32_t wifi_stream_id(void) { return source.stream_id; }
 void wifi_stream_submit(const ads1299_frame_t *frame) {
     if (!source_running) return;
-    source.sequence = frame->sequence; source.timestamp_us = frame->timestamp_us;
-    memcpy(source.raw, frame->raw, EEG_SAMPLE_SIZE);
-    (void)eeg_queue_push(&samples, &source);
+    eeg_sample_t *slot = eeg_queue_reserve(&samples);
+    if (!slot) return;
+    slot->sequence = frame->sequence; slot->timestamp_us = frame->timestamp_us;
+    slot->stream_id = source.stream_id; slot->mclk_hz = source.mclk_hz;
+    slot->nominal_rate = source.nominal_rate; slot->gain = source.gain;
+    slot->mode = source.mode; slot->mclk_assumed = source.mclk_assumed;
+    memcpy(slot->raw, frame->raw, EEG_SAMPLE_SIZE);
+    eeg_queue_commit(&samples);
+    __sev();
 }
 void wifi_stream_report(void) {
+    debug_log("perf core1 us net(avg/max)=%lu/%lu service=%lu/%lu qage_max=%lu ack_delay_max=%lu inflight_max=%lu\r\n",
+        (unsigned long)atomic_load(&diag.network_avg_us), (unsigned long)atomic_load(&diag.network_max_us),
+        (unsigned long)atomic_load(&diag.service_avg_us), (unsigned long)atomic_load(&diag.service_max_us),
+        (unsigned long)atomic_load(&diag.queue_age_max_us), (unsigned long)atomic_load(&diag.ack_delay_max_us),
+        (unsigned long)atomic_load(&diag.inflight_max));
     uint32_t ip = atomic_load(&diag.client_ip);
     uint32_t tail = atomic_load(&samples.tail), head = atomic_load(&samples.head);
     uint32_t depth = head - tail; if (depth > EEG_QUEUE_CAPACITY) depth = EEG_QUEUE_CAPACITY;

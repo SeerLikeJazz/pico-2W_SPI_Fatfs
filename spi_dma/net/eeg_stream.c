@@ -55,20 +55,48 @@ bool eeg_queue_stop_due(eeg_queue_t *q, uint32_t *seen) {
     return true;
 }
 
+eeg_sample_t *eeg_queue_reserve(eeg_queue_t *q) {
+    uint32_t h = atomic_load_explicit(&q->head, memory_order_relaxed);
+    uint32_t depth = h - atomic_load_explicit(&q->tail, memory_order_acquire);
+    if (depth == EEG_QUEUE_CAPACITY) {
+        atomic_store_explicit(&q->drops, atomic_load_explicit(&q->drops, memory_order_relaxed) + 1u, memory_order_relaxed);
+        return NULL;
+    }
+    if (depth + 1u > atomic_load_explicit(&q->peak, memory_order_relaxed))
+        atomic_store_explicit(&q->peak, depth + 1u, memory_order_relaxed);
+    return &q->items[h & (EEG_QUEUE_CAPACITY - 1u)];
+}
+void eeg_queue_commit(eeg_queue_t *q) {
+    uint32_t h = atomic_load_explicit(&q->head, memory_order_relaxed);
+    atomic_store_explicit(&q->head, h + 1u, memory_order_release);
+}
+unsigned eeg_queue_read_batch(eeg_queue_t *q, const eeg_sample_t **items,
+                             unsigned maximum, uint32_t stop_seen) {
+    uint32_t t = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    uint32_t h = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint32_t count = h - t;
+    uint32_t contiguous = EEG_QUEUE_CAPACITY - (t & (EEG_QUEUE_CAPACITY - 1u));
+    if (count > contiguous) count = contiguous;
+    if (count > maximum) count = maximum;
+    if (atomic_load_explicit(&q->stop_serial, memory_order_acquire) != stop_seen) {
+        uint32_t distance = atomic_load_explicit(&q->stop_cursor, memory_order_acquire) - t;
+        if (distance < count) count = distance;
+    }
+    *items = &q->items[t & (EEG_QUEUE_CAPACITY - 1u)];
+    return count;
+}
+void eeg_queue_consume(eeg_queue_t *q, unsigned count) {
+    uint32_t t = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    atomic_store_explicit(&q->tail, t + count, memory_order_release);
+}
+
 static void le16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void le32(uint8_t *p, uint32_t v) { for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8u*i)); }
 static void le64(uint8_t *p, uint64_t v) { for (unsigned i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (8u*i)); }
-uint32_t eeg_crc32(const void *data, size_t length) {
-    const uint8_t *p = data;
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= p[i];
-        for (unsigned bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0);
-    }
-    return crc ^ 0xffffffffu;
+void eeg_stream_init(eeg_stream_t *s) {
+    memset(s, 0, sizeof *s);
+    s->building = s->buffers[0]; s->pending = s->buffers[1];
 }
-void eeg_stream_init(eeg_stream_t *s) { memset(s, 0, sizeof *s); }
 static bool same_config(const eeg_sample_t *a, const eeg_sample_t *b) {
     return a->stream_id == b->stream_id && a->mclk_hz == b->mclk_hz &&
         a->nominal_rate == b->nominal_rate && a->gain == b->gain &&
@@ -88,7 +116,7 @@ bool eeg_stream_flush(eeg_stream_t *s) {
     if (s->have_previous && s->first.sequence != s->expected_sample) flags |= 4u;
     if (s->first.mclk_assumed) flags |= 8u;
     uint8_t *p = s->building;
-    memcpy(p, "EEG1", 4); p[4] = 1; p[5] = 1;
+    memcpy(p, "EEG1", 4); p[4] = 2; p[5] = 1;
     le16(p+6, flags); le16(p+8, EEG_PACKET_SIZE); le16(p+10, EEG_HEADER_SIZE);
     le16(p+12, s->count); le16(p+14, EEG_SAMPLE_SIZE);
     le32(p+16, s->next_packet++); le32(p+20, s->first.sequence);
@@ -96,10 +124,10 @@ bool eeg_stream_flush(eeg_stream_t *s) {
     le16(p+36, s->first.nominal_rate); p[38] = s->first.gain; p[39] = s->first.mode;
     le32(p+40, s->first.stream_id);
     size_t used = EEG_HEADER_SIZE + s->count * EEG_SAMPLE_SIZE;
-    memset(p + used, 0, EEG_CRC_OFFSET - used);
-    le32(p+EEG_CRC_OFFSET, eeg_crc32(p, EEG_CRC_OFFSET));
+    memset(p + used, 0, EEG_TAIL_OFFSET - used);
     memcpy(p+1020, "\x0d\x0a\xa5\x5a", 4);
-    memcpy(s->pending, p, EEG_PACKET_SIZE);
+    s->building = s->pending;
+    s->pending = p;
     s->pending_samples = s->count;
     s->expected_sample = s->first.sequence + s->count;
     s->have_previous = true;

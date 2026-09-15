@@ -2,6 +2,7 @@
 #define ADS1299_H
 #include "ads1299_format.h"
 #include "ads1299_registers.h"
+#include "perf.h"
 
 typedef enum { ADS_MODE_TEST, ADS_MODE_SHORT, ADS_MODE_NORMAL, ADS_MODE_IMPEDANCE } ads1299_mode_t;
 typedef enum {
@@ -42,8 +43,14 @@ bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request
 bool ads1299_start(void);
 bool ads1299_stop(void);
 void ads1299_poll(void); /* Watchdog + max two automatic recovery attempts. */
+/* Supplies raw/sequence/timestamp only; no channel decoding. */
 bool ads1299_get_frame(ads1299_frame_t *frame);
 void ads1299_get_stats(ads1299_stats_t *stats);
+typedef struct {
+    perf_counter_t drdy_irq, dma_irq;
+    uint32_t queue_age_max_us, poll_gap_max_us, critical_max_us;
+} ads1299_perf_t;
+void ads1299_get_perf(ads1299_perf_t *out);
 void ads1299_get_info(ads1299_info_t *info);
 /* Control access requires stopped state. Write invalidates configured state;
  * call configure() before starting again. Reserved/read-only writes rejected. */

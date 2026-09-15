@@ -6,7 +6,6 @@ import select
 import struct
 import threading
 import time
-import zlib
 
 from network import REQUEST, REPLY
 from protocol import HEADER, TAIL, RATES, GAINS
@@ -14,7 +13,7 @@ from protocol import HEADER, TAIL, RATES, GAINS
 
 def make_packet(sequence=0, first=0, timestamp=0, rate=250, gain=1, stream=1, count=36, mode=0):
     raw = bytearray(1024)
-    HEADER.pack_into(raw, 0, b'EEG1', 1, 1, 8 | (count < 36) | (2 if sequence == 0 else 0),
+    HEADER.pack_into(raw, 0, b'EEG1', 2, 1, 8 | (count < 36) | (2 if sequence == 0 else 0),
                      1024, 44, count, 27, sequence & 0xffffffff, first & 0xffffffff,
                      timestamp, 2048000, rate, gain, mode, stream)
     for sample in range(count):
@@ -25,7 +24,6 @@ def make_packet(sequence=0, first=0, timestamp=0, rate=250, gain=1, stream=1, co
             if mode == 1: value = 0
             elif mode == 3: value = 120000 if math.sin(2*math.pi*31.25*(first+sample)/rate)>=0 else -120000
             raw[offset + 3 + ch*3:offset + 6 + ch*3] = value.to_bytes(3, 'big', signed=True)
-    struct.pack_into('<I', raw, 1016, zlib.crc32(raw[:1016]))
     raw[1020:] = TAIL
     return bytes(raw)
 

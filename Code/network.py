@@ -139,7 +139,7 @@ class Receiver(threading.Thread):
                             t, d = self.tracking, self.decoder
                             self.stats = (f'接收 {t.samples} 帧 | 缺包 {t.packet_gaps} / 缺帧 {t.sample_gaps}'
                                           f' | 乱序 {t.reorders} | 状态异常 {t.bad_status}'
-                                          f' | CRC/头/尾/填充 {d.crc_errors}/{d.header_errors}/'
+                                          f' | 头/尾/填充 {d.header_errors}/'
                                           f'{d.tail_errors}/{d.padding_errors}')
                     except socket.timeout:
                         pass

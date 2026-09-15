@@ -20,7 +20,7 @@ static ads1299_settings_t settings = {
 };
 static ads1299_frame_t latest;
 static bool have_sample;
-static bool sample_preview;
+static perf_counter_t acquisition_time, auxiliary_time;
 static usb_command_parser_t command_parser;
 
 static void parameter_help(void) {
@@ -29,7 +29,7 @@ static void parameter_help(void) {
 
 static void help(void) {
     debug_log("Commands: ? help; s status; r registers (pause/resume); "
-              "x stop; g start; i reset/retry; t test; h short; n normal; p preview25Hz on/off.\r\n");
+              "x stop; g start; i reset/retry; t test; h short; n normal; raw transport; preview disabled.\r\n");
     parameter_help();
     debug_log("Example :rate 1000<Enter>, :gain 24<Enter>. ':' required; RAM only; i retries RAM settings.\r\n");
 #if ENABLE_SD_CARD
@@ -82,9 +82,20 @@ static uint32_t report_status(uint64_t elapsed_us, uint32_t previous_frames) {
               s.dma_errors, s.bad_frames, s.recoveries, debug_log_dropped_messages(),
               debug_log_discarded_bytes(), debug_uart_dropped_messages(), ads1299_error_name(v.last_error));
     if (have_sample)
-        debug_log("latest seq=%" PRIu32 " t=%" PRIu64 "us status=%06" PRIx32
-                  " ch1=%" PRId32 " ch2=%" PRId32 " (raw codes; may be stale when stopped)\r\n",
-                  latest.sequence, latest.timestamp_us, latest.status, latest.channel[0], latest.channel[1]);
+        debug_log("latest seq=%" PRIu32 " t=%" PRIu64 "us (raw only)\r\n",
+                  latest.sequence, latest.timestamp_us);
+    ads1299_perf_t perf; ads1299_get_perf(&perf);
+    debug_log("perf us IRQ drdy(avg/max)=%lu/%lu dma=%lu/%lu qage_max=%lu pollgap_max=%lu critical_max=%lu\r\n",
+              (unsigned long)(perf.drdy_irq.count ? perf.drdy_irq.total_us/perf.drdy_irq.count : 0),
+              (unsigned long)perf.drdy_irq.max_us,
+              (unsigned long)(perf.dma_irq.count ? perf.dma_irq.total_us/perf.dma_irq.count : 0),
+              (unsigned long)perf.dma_irq.max_us, (unsigned long)perf.queue_age_max_us,
+              (unsigned long)perf.poll_gap_max_us, (unsigned long)perf.critical_max_us);
+    debug_log("perf sampled core0 us acquisition(avg/max)=%lu/%lu auxiliary=%lu/%lu\r\n",
+              (unsigned long)(acquisition_time.count ? acquisition_time.total_us/acquisition_time.count : 0),
+              (unsigned long)acquisition_time.max_us,
+              (unsigned long)(auxiliary_time.count ? auxiliary_time.total_us/auxiliary_time.count : 0),
+              (unsigned long)auxiliary_time.max_us);
     return s.frames;
 }
 
@@ -101,10 +112,7 @@ static void handle_command(int c) {
     switch (c) {
     case '?': help(); break;
     case 's': report_config(); wifi_stream_report(); break;
-    case 'p':
-        sample_preview = !sample_preview;
-        debug_log("25Hz decimated preview=%d; sample,seq,time_us,ch1,...,ch8 (not full-rate capture)\r\n", sample_preview);
-        break;
+    case 'p': debug_log("Preview disabled: raw transport only.\r\n"); break;
     case 'x': report_result("stop", ads1299_stop()); break;
     case 'g': report_result("start (use i if unconfigured)", ads1299_start()); break;
     case 'i':
@@ -185,15 +193,22 @@ int main(void) {
     help();
     uint64_t last_report = time_us_64();
     uint32_t previous_frames = 0;
-    uint64_t last_preview = 0;
-    uint32_t preview_sequence = 0;
+    uint64_t next_auxiliary = 0;
+    uint32_t loop_count = 0;
     bool was_connected = false;
     while (true) {
+        bool measure = (++loop_count & 63u) == 0;
+        uint32_t began = measure ? time_us_32() : 0;
         ads1299_poll();
         for (unsigned i = 0; i < 16u && ads1299_get_frame(&latest); ++i) {
             have_sample = true;
             wifi_stream_submit(&latest);
         }
+        if (measure) perf_add(&acquisition_time, time_us_32() - began);
+        uint64_t now = time_us_64();
+        if (now < next_auxiliary) { tight_loop_contents(); continue; }
+        next_auxiliary = now + 1000u; /* USB and control: at most 1 kHz. */
+        began = time_us_32();
         debug_console_poll();
         bool connected = debug_console_connected();
         if (connected && !was_connected) { report_config(); help(); }
@@ -202,16 +217,8 @@ int main(void) {
 #if ENABLE_WIFI_STREAM
         wifi_control_apply(&settings);
 #endif
-        uint64_t now = time_us_64();
-        if (sample_preview && have_sample && latest.sequence != preview_sequence && now - last_preview >= 40000u) {
-            debug_log("sample,%" PRIu32 ",%" PRIu64 ",%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32
-                      ",%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32 "\r\n",
-                      latest.sequence, latest.timestamp_us, latest.channel[0], latest.channel[1],
-                      latest.channel[2], latest.channel[3], latest.channel[4], latest.channel[5],
-                      latest.channel[6], latest.channel[7]);
-            last_preview = now;
-            preview_sequence = latest.sequence;
-        }
+        perf_add(&auxiliary_time, time_us_32() - began);
+        now = time_us_64();
         if (now - last_report >= 1000000u) {
             previous_frames = report_status(now - last_report, previous_frames);
             wifi_stream_report();

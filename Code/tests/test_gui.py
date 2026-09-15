@@ -67,7 +67,7 @@ class GuiTests(unittest.TestCase):
             w.toggle_display(); pump(lambda: w.plot.count > 3000, timeout=5)
             w.amplitude.setValue(500000)
             w.resize(1200, 800); app.processEvents()
-            self.assertTrue(w.grab().save(str(Path(__file__).resolve().parents[1] / 'ui-simulation.png')))
+            self.assertTrue(w.grab().save(str(Path(os.environ.get('EEG_TEST_SCREENSHOT', str(Path(__file__).resolve().parents[1] / 'ui-simulation.png'))))))
             w.disconnect_device(); pump(lambda: not w.receiver.is_alive())
             self.assertFalse(sim.running)
             w.connect_device(); pump(lambda: w.state == '待机' and not w.busy())
@@ -141,41 +141,25 @@ class GuiTests(unittest.TestCase):
         finally:
             self.finish(w, sim)
 
-    def test_background_poll_preserves_controls_receipt_and_user_click(self):
+    def test_no_periodic_queries_and_manual_query_works(self):
         from unittest.mock import patch
         from network import control as real_control
         sim = Simulator(data_port=0, control_port=0).start()
         w = self.create_window(sim)
         try:
-            receipt = w.control_label.text()
-            sim.reply_delay = .25
-            w.next_query = 0
-            pump(lambda: w.busy() and w.background_request)
-            w.refresh()
-            w.mode.showPopup()
-            def stable():
-                self.assertTrue(w.mode.isEnabled())
-                self.assertTrue(w.rate_button.isEnabled())
-                self.assertTrue(w.display_button.isEnabled())
-                self.assertTrue(w.mode.view().isVisible())
-                self.assertEqual(w.control_label.text(), receipt)
-                return not w.busy()
-            pump(stable)
-            w.mode.hidePopup()
             with patch('main.control', wraps=real_control) as requests:
                 w.next_query = 0
-                pump(lambda: w.busy() and w.background_request)
-                w.rate.setCurrentText('1000'); w.rate_button.click()
-                self.assertEqual(w.pending_action, (1, 1000))
-                w.send_control(1, 500)  # Repeated click must not replace the first.
-                pump(lambda: sim.rate == 1000 and not w.busy() and w.pending_action is None)
-                self.assertEqual(sum(c.args[3] == 1 for c in requests.call_args_list), 1)
-            w.toggle_display(); pump(lambda: w.state == '采集中' and not w.busy())
-            w.next_query = 0; pump(lambda: w.busy() and w.background_request)
-            w.refresh(); self.assertTrue(w.display_button.isEnabled())
-            w.display_button.click()
-            pump(lambda: w.state == '待机' and not w.busy())
-            self.assertFalse(sim.running)
+                until = time.monotonic() + 2.3
+                pump(lambda: time.monotonic() >= until)
+                self.assertEqual(requests.call_count, 0)
+                w.query_button.click()
+                pump(lambda: requests.call_count == 1 and not w.busy())
+                self.assertEqual(requests.call_args.args[3], 0)
+                w.toggle_display(); pump(lambda: w.state == '采集中' and not w.busy())
+                calls = requests.call_count
+                until = time.monotonic() + 2.3
+                pump(lambda: time.monotonic() >= until)
+                self.assertEqual(requests.call_count, calls)
         finally:
             self.finish(w, sim)
 
@@ -188,7 +172,7 @@ class GuiTests(unittest.TestCase):
                 time.sleep(.15)
                 raise TimeoutError('injected background timeout')
             with patch('main.control', side_effect=unavailable):
-                w.next_query = 0
+                w.send_control(0, 0, background=True)
                 pump(lambda: w.busy() and w.background_request)
                 w.send_control(1, 1000)
                 pump(lambda: w.state == '故障' and not w.busy())

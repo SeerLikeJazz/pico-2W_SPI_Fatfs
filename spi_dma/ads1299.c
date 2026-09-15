@@ -9,10 +9,11 @@
 #include "hardware/spi.h"
 #include "hardware/sync.h"
 #include "hardware/clocks.h"
+#include "perf.h"
 
 _Static_assert(ADS_MCLK_HZ >= 100000u && ADS_MCLK_HZ <= 2500000u, "Check ADS external MCLK");
-_Static_assert(ADS_SPI_HZ > 0u && ADS_SPI_HZ <= 10000000u, "Conservative SPI limit for DVDD=3.3V");
-_Static_assert(ADS_SPI_MAX_HZ >= ADS_SPI_HZ && ADS_SPI_MAX_HZ <= 10000000u, "SPI request range");
+_Static_assert(ADS_SPI_HZ == 15000000u, "Fixed 15 MHz SPI requires DVDD=3.3V");
+_Static_assert(ADS_SPI_MAX_HZ == ADS_SPI_HZ, "SPI request range");
 _Static_assert(ADS_QUEUE_CAPACITY >= 2u, "Queue too small");
 _Static_assert((ADS_QUEUE_CAPACITY & (ADS_QUEUE_CAPACITY - 1u)) == 0u, "Queue must be power of two for counter wrap");
 
@@ -26,6 +27,8 @@ static ads1299_info_t info;
 static volatile ads1299_stats_t stats;
 static raw_frame_t queue[ADS_QUEUE_CAPACITY], active;
 static volatile uint32_t head, tail;
+static ads1299_perf_t timing;
+static uint32_t next_watchdog_us, previous_poll_us;
 static volatile bool dma_active, rx_done, active_tainted;
 static volatile ads1299_error_t pending_fault;
 static volatile uint64_t last_drdy_us, dma_started_us;
@@ -214,7 +217,7 @@ static bool dma_has_error(void) {
            (spi_get_hw(spi0)->ris & SPI_SSPRIS_RORRIS_BITS);
 }
 
-static void dma_irq_handler(void) {
+static void dma_irq_work(void) {
     uint32_t flags = dma_hw->ints0 & dma_mask;
     if (!flags) return;
     dma_hw->ints0 = flags; /* W1C only our channels. Shared IRQ. */
@@ -227,7 +230,7 @@ static void dma_irq_handler(void) {
     finish_frame(); /* May defer SPI tail completion to poll/next DRDY. */
 }
 
-static void drdy_handler(uint gpio, uint32_t events) {
+static void drdy_work(uint gpio, uint32_t events) {
     if (gpio != ADS_PIN_DRDY || !(events & GPIO_IRQ_EDGE_FALL) || !info.running) return;
     uint64_t now = time_us_64();
     last_drdy_us = now;
@@ -259,6 +262,18 @@ static void drdy_handler(uint gpio, uint32_t events) {
      * throughout RDATAC, including SPI's final-bit tail and between frames. */
     dma_start_channel_mask(1u << rx_channel);
     dma_start_channel_mask(1u << tx_channel);
+}
+
+/* Each timing domain has a single owner. IRQs have identical priority. */
+static void dma_irq_handler(void) {
+    uint32_t began = time_us_32();
+    dma_irq_work();
+    perf_add(&timing.dma_irq, time_us_32() - began);
+}
+static void drdy_handler(uint gpio, uint32_t events) {
+    uint32_t began = time_us_32();
+    drdy_work(gpio, events);
+    perf_add(&timing.drdy_irq, time_us_32() - began);
 }
 
 void ads1299_power_on(void) {
@@ -397,6 +412,8 @@ bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request
     if (!info.initialized || info.fatal) return fail(ADS_ERR_STATE);
     if (!ads1299_spi_plan(ADS_MCLK_HZ, rate, clock_get_hz(clk_peri), ADS_SPI_HZ,
                          ADS_SPI_MAX_HZ, spi_request)) return fail(ADS_ERR_SPI_BUDGET);
+    if (ads1299_spi_actual(clock_get_hz(clk_peri), *spi_request) != ADS_SPI_HZ)
+        return fail(ADS_ERR_SPI_BUDGET);
     return true;
 }
 
@@ -411,7 +428,7 @@ bool ads1299_configure(const ads1299_settings_t *settings) {
     /* Fully stopped, DMA disabled, CS high. Preserve chosen rate through FIFO resets. */
     spi_request_hz = request;
     info.spi_hz = spi_set_baudrate(spi0, request);
-    if (info.spi_hz > ADS_SPI_MAX_HZ || !ads1299_spi_budget_ok(ADS_MCLK_HZ, rate, info.spi_hz))
+    if (info.spi_hz != ADS_SPI_HZ || !ads1299_spi_budget_ok(ADS_MCLK_HZ, rate, info.spi_hz))
         return fail(ADS_ERR_SPI_BUDGET);
     if (!command(ADS_CMD_SDATAC)) return false;
     memset(info.expected, 0, sizeof info.expected);
@@ -458,9 +475,10 @@ bool ads1299_start(void) {
     pending_fault = ADS_OK;
     gpio_acknowledge_irq(ADS_PIN_DRDY, GPIO_IRQ_EDGE_FALL);
     last_drdy_us = time_us_64();
+    previous_poll_us = 0; next_watchdog_us = time_us_32();
     if (state_callback) state_callback(true, &info.settings);
     info.running = true;
-    dma_set_irq0_channel_mask_enabled(dma_mask, true);
+    dma_set_irq0_channel_mask_enabled(1u << rx_channel, true);
     gpio_set_irq_enabled(ADS_PIN_DRDY, GPIO_IRQ_EDGE_FALL, true);
     /* Leave CS low until stop(), not until TX DMA completion. */
     return true;
@@ -489,17 +507,45 @@ bool ads1299_init(const ads1299_settings_t *settings) {
 
 void ads1299_poll(void) {
     if (!info.running) return;
+    uint32_t now32 = time_us_32();
+    if (previous_poll_us && now32 - previous_poll_us > timing.poll_gap_max_us)
+        timing.poll_gap_max_us = now32 - previous_poll_us;
+    previous_poll_us = now32;
+    /* Normally RX IRQ completes the frame. Poll only its possible SPI tail;
+     * full watchdog work is capped at 10 kHz, not every empty main-loop pass. */
+    if (dma_active && rx_done) {
+        uint32_t began = time_us_32();
+        uint32_t saved = save_and_disable_interrupts();
+        finish_frame();
+        restore_interrupts(saved);
+        uint32_t elapsed = time_us_32() - began;
+        if (elapsed > timing.critical_max_us) timing.critical_max_us = elapsed;
+    }
+    if (pending_fault == ADS_OK && (int32_t)(now32 - next_watchdog_us) < 0) return;
+    next_watchdog_us = now32 + 100u;
+    uint32_t began = time_us_32();
     uint32_t saved = save_and_disable_interrupts();
-    finish_frame();
     ads1299_error_t fault = pending_fault;
+    bool active_snapshot = dma_active;
+    uint64_t dma_start = dma_started_us, drdy_time = last_drdy_us;
+    bool hardware_error = active_snapshot && dma_has_error();
+    restore_interrupts(saved);
+    uint32_t elapsed = time_us_32() - began;
+    if (elapsed > timing.critical_max_us) timing.critical_max_us = elapsed;
     uint64_t now = time_us_64();
     uint32_t dma_deadline = transfer_us * 2u + 100u;
     if (dma_deadline < info.period_us) dma_deadline = info.period_us;
-    if (fault == ADS_OK && dma_active && dma_has_error()) fault = ADS_ERR_DMA_HW;
-    if (fault == ADS_OK && dma_active && now - dma_started_us > dma_deadline) fault = ADS_ERR_DMA_TIMEOUT;
-    /* 10 periods also covers START digital-filter settling. */
-    if (fault == ADS_OK && now - last_drdy_us > (uint64_t)info.period_us * 10u + 10000u)
+    if (fault == ADS_OK && hardware_error) fault = ADS_ERR_DMA_HW;
+    if (fault == ADS_OK && active_snapshot && now - dma_start > dma_deadline) fault = ADS_ERR_DMA_TIMEOUT;
+    if (fault == ADS_OK && now - drdy_time > (uint64_t)info.period_us * 10u + 10000u)
         fault = ADS_ERR_DRDY_TIMEOUT;
+    if (fault == ADS_OK) return;
+    /* An IRQ may have completed/started a frame after the snapshot. Recheck
+     * timeout candidates under the lock before stopping a healthy stream. */
+    saved = save_and_disable_interrupts();
+    if (pending_fault != ADS_OK) fault = pending_fault;
+    else if (fault == ADS_ERR_DMA_TIMEOUT && (!dma_active || dma_started_us != dma_start)) fault = ADS_OK;
+    else if (fault == ADS_ERR_DRDY_TIMEOUT && last_drdy_us != drdy_time) fault = ADS_OK;
     if (fault != ADS_OK) {
         pending_fault = fault;
         gpio_set_irq_enabled(ADS_PIN_DRDY, GPIO_IRQ_EDGE_FALL, false);
@@ -523,15 +569,20 @@ void ads1299_poll(void) {
 
 bool ads1299_get_frame(ads1299_frame_t *frame) {
     if (!frame) return false;
-    uint32_t saved = save_and_disable_interrupts();
-    if (tail == head) { restore_interrupts(saved); return false; }
-    raw_frame_t raw = queue[tail % ADS_QUEUE_CAPACITY];
-    ++tail;
-    restore_interrupts(saved);
+    /* Same-core SPSC: ISR cannot reuse this slot until tail is published.
+     * Stop/reset only run on this main context, never concurrently. */
+    uint32_t t = tail;
+    if (t == head) return false;
+    __dmb();
+    raw_frame_t raw = queue[t % ADS_QUEUE_CAPACITY];
+    __dmb();
+    tail = t + 1u;
+    uint32_t age = (uint32_t)(time_us_64() - raw.timestamp_us);
+    if (age > timing.queue_age_max_us) timing.queue_age_max_us = age;
     memcpy(frame->raw, raw.raw, ADS_FRAME_BYTES);
     frame->sequence = raw.sequence;
     frame->timestamp_us = raw.timestamp_us;
-    (void)ads1299_decode(frame);
+    /* Raw transport only: decoded fields are intentionally untouched. */
     return true;
 }
 
@@ -539,6 +590,13 @@ void ads1299_get_stats(ads1299_stats_t *out) {
     if (!out) return;
     uint32_t saved = save_and_disable_interrupts();
     *out = stats;
+    restore_interrupts(saved);
+}
+
+void ads1299_get_perf(ads1299_perf_t *out) {
+    if (!out) return;
+    uint32_t saved = save_and_disable_interrupts();
+    *out = timing;
     restore_interrupts(saved);
 }
 
