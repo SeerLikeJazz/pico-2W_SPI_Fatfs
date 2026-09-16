@@ -41,6 +41,9 @@
 #define ADS_REFERENCE_SETTLE_MS 150u
 #define ADS_CONTROL_TIMEOUT_US 5000u
 #define ADS_QUEUE_CAPACITY 64u
-#define ADS_MAX_AUTO_RECOVERIES 2u
+#define ADS_MAX_AUTO_RECOVERIES 0u /* Fault stops acquisition; explicit START retries. */
+#ifndef ENABLE_ACQ_PROFILE
+#define ENABLE_ACQ_PROFILE 0
+#endif
 
 #endif

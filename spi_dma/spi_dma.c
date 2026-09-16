@@ -1,229 +1,155 @@
-#include <inttypes.h>
+#include <string.h>
+#ifdef USB_APP_TEST
+#include "tests/usb_app_fake.h"
+#else
 #include "pico/stdlib.h"
+#include "tusb.h"
+#endif
 #include "ads1299.h"
 #include "ads1299_config.h"
-#include "debug_console.h"
-#include "net/wifi_stream.h"
-#if ENABLE_WIFI_STREAM
-#include "wifi_control.h"
-#endif
-#include "usb_commands.h"
-#include "ads1299_control.h"
+#include "usb_link.h"
 
-#if ENABLE_SD_CARD
-void sd_legacy_run(void);
-#endif
-
+static usb_link_t link_state;
+static usb_parser_t parser;
 static ads1299_settings_t settings = {
-    .nominal_sps = ADS_DEFAULT_RATE, .gain = ADS_DEFAULT_GAIN, .mode = ADS_DEFAULT_MODE,
-    .srb1 = ADS_NORMAL_SRB1, .srb2 = ADS_NORMAL_SRB2, .bias = ADS_NORMAL_BIAS
+    .nominal_sps=ADS_DEFAULT_RATE, .gain=ADS_DEFAULT_GAIN, .mode=ADS_DEFAULT_MODE,
+    .srb1=ADS_NORMAL_SRB1, .srb2=ADS_NORMAL_SRB2, .bias=ADS_NORMAL_BIAS
 };
-static ads1299_frame_t latest;
-static bool have_sample;
-static perf_counter_t acquisition_time, auxiliary_time;
-static usb_command_parser_t command_parser;
-
-static void parameter_help(void) {
-    debug_log(":rate SPS [250 500 1000 2000 4000 8000 16000]; :gain N [1 2 4 6 8 12 24]. Enter to apply.\r\n");
+static bool running, lost_connection, connected;
+static uint32_t generation, disconnects, stalls, stop_reason;
+static uint32_t usb_task_max, main_max;
+/* Callbacks execute in tud_task on Core 0, never issue blocking ADC commands. */
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
+    (void)itf; (void)rts;
+    if (!dtr) lost_connection=true;
 }
-
-static void help(void) {
-    debug_log("Commands: ? help; s status; r registers (pause/resume); "
-              "x stop; g start; i reset/retry; t test; h short; n normal; raw transport; preview disabled.\r\n");
-    parameter_help();
-    debug_log("Example :rate 1000<Enter>, :gain 24<Enter>. ':' required; RAM only; i retries RAM settings.\r\n");
-#if ENABLE_SD_CARD
-    debug_log("b: legacy SD/BDF 100 MiB test with ADS stopped (manual resume).\r\n");
-#endif
+void tud_umount_cb(void) { lost_connection=true; }
+void tud_mount_cb(void) { if(connected) lost_connection=true; }
+static void acquisition_state(bool active, const ads1299_settings_t *current) {
+    running=active;
+    if(active) usb_link_begin(&link_state,++generation,current);
+    else usb_link_flush(&link_state);
 }
-
-static void report_config(void) {
-    ads1299_info_t v;
-    ads1299_get_info(&v);
-    uint8_t rate = 6;
-    const ads1299_settings_t *current = v.configured ? &v.settings : &settings;
-    (void)ads1299_rate_code(current->nominal_sps, &rate);
-    uint32_t actual_milli_sps = (uint32_t)((uint64_t)ADS_MCLK_HZ * 1000u / (128u << rate));
-    debug_log("Pico2W ADS1299 SPI0 DMA; SD=%d UART=%d; 5V_EN(GP21)=%d\r\n",
-              ENABLE_SD_CARD, ENABLE_UART_LOG, gpio_get(ADS_PIN_5V_EN));
-    debug_log("Pins GP16=DOUT GP17=CS GP18=SCLK GP19=DIN GP20=DRDY GP21=5V_EN\r\n");
-    debug_log("EXTERNAL MCLK=%u Hz ASSUMED: verify U12! CLKSEL=LOW. SPI actual=%" PRIu32 " Hz, mode1.\r\n",
-              (unsigned)ADS_MCLK_HZ, v.spi_hz);
-    debug_log("%s %u SPS nominal, calculated=%" PRIu32 ".%03" PRIu32 " SPS; "
-              "gain=%u mode=%s test=fCLK/2^21; normal SRB1=%d SRB2=%d BIAS=%d\r\n",
-              v.configured ? "Verified" : "INVALID hardware config; RAM retry target:",
-              current->nominal_sps, actual_milli_sps / 1000u, actual_milli_sps % 1000u,
-              current->gain, ads1299_mode_name(current->mode), current->srb1, current->srb2, current->bias);
-    debug_log("ID=0x%02x (8ch low5=0x1e; commonly 0x3e); init=%d configured=%d running=%d fatal=%d last=%s\r\n",
-              v.id, v.initialized, v.configured, v.running, v.fatal, ads1299_error_name(v.last_error));
-    for (unsigned a = 1; a < ADS_REG_COUNT; ++a) {
-        if (v.checked_mask & (1u << a))
-            debug_log("REG %02x write=%02x read=%02x %s\r\n", a, v.expected[a], v.readback[a],
-                      v.mismatch_mask & (1u << a) ? "FAIL" : "OK(masked if RO bits)");
-    }
-    if (settings.mode == ADS_MODE_NORMAL)
-        debug_log("Normal mode: verify H2/H5 reference jumpers and INxN wiring; SRB/BIAS are opt-in.\r\n");
+static unsigned usb_write(void *context, const uint8_t *data, unsigned length) {
+    (void)context;
+    unsigned available=tud_cdc_write_available();
+    if(length>available) length=available;
+    return length ? tud_cdc_write(data,length) : 0;
 }
-
-static uint32_t report_status(uint64_t elapsed_us, uint32_t previous_frames) {
-    ads1299_stats_t s;
-    ads1299_info_t v;
-    ads1299_get_stats(&s);
-    ads1299_get_info(&v);
-    uint32_t rate_milli = elapsed_us ?
-        (uint32_t)((uint64_t)(s.frames - previous_frames) * 1000000000ull / elapsed_us) : 0;
-    debug_log("run=%d mode=%s DRDY=%" PRIu32 " frames=%" PRIu32 " fps=%" PRIu32 ".%03" PRIu32
-              " busy=%" PRIu32 " qdrop=%" PRIu32 " qpeak=%" PRIu32 " stopdiscard=%" PRIu32 "\r\n",
-              v.running, ads1299_mode_name(v.settings.mode), s.drdy, s.frames,
-              rate_milli / 1000u, rate_milli % 1000u, s.busy_drdy, s.queue_drops, s.queue_peak, s.discarded_on_stop);
-    debug_log("timeout(drdy/dma/spi)=%" PRIu32 "/%" PRIu32 "/%" PRIu32 " dmaerr=%" PRIu32
-              " bad=%" PRIu32 " recovery=%" PRIu32 " logdrop=%" PRIu32 " logbytes=%" PRIu32
-              " uartdrop=%" PRIu32 " last=%s\r\n", s.drdy_timeouts, s.dma_timeouts, s.spi_timeouts,
-              s.dma_errors, s.bad_frames, s.recoveries, debug_log_dropped_messages(),
-              debug_log_discarded_bytes(), debug_uart_dropped_messages(), ads1299_error_name(v.last_error));
-    if (have_sample)
-        debug_log("latest seq=%" PRIu32 " t=%" PRIu64 "us (raw only)\r\n",
-                  latest.sequence, latest.timestamp_us);
-    ads1299_perf_t perf; ads1299_get_perf(&perf);
-    debug_log("perf us IRQ drdy(avg/max)=%lu/%lu dma=%lu/%lu qage_max=%lu pollgap_max=%lu critical_max=%lu\r\n",
-              (unsigned long)(perf.drdy_irq.count ? perf.drdy_irq.total_us/perf.drdy_irq.count : 0),
-              (unsigned long)perf.drdy_irq.max_us,
-              (unsigned long)(perf.dma_irq.count ? perf.dma_irq.total_us/perf.dma_irq.count : 0),
-              (unsigned long)perf.dma_irq.max_us, (unsigned long)perf.queue_age_max_us,
-              (unsigned long)perf.poll_gap_max_us, (unsigned long)perf.critical_max_us);
-    debug_log("perf sampled core0 us acquisition(avg/max)=%lu/%lu auxiliary=%lu/%lu\r\n",
-              (unsigned long)(acquisition_time.count ? acquisition_time.total_us/acquisition_time.count : 0),
-              (unsigned long)acquisition_time.max_us,
-              (unsigned long)(auxiliary_time.count ? auxiliary_time.total_us/auxiliary_time.count : 0),
-              (unsigned long)auxiliary_time.max_us);
-    return s.frames;
+static bool stop(unsigned reason) {
+    bool ok=true;
+    if(running) ok=ads1299_stop();
+    else { ads1299_info_t info; ads1299_get_info(&info); ok=!info.fatal; }
+    stop_reason=reason;
+    return ok;
 }
-
-static void report_result(const char *operation, bool ok) {
-    ads1299_info_t v;
-    ads1299_get_info(&v);
-    debug_log("%s: %s; running=%d last=%s\r\n", operation, ok ? "OK" : "FAILED",
-              v.running, ads1299_error_name(v.last_error));
+static void reply(const usb_request_t *request, unsigned result) {
+    ads1299_info_t info; ads1299_stats_t stats; ads1299_perf_t perf;
+    ads1299_get_info(&info); ads1299_get_stats(&stats); ads1299_get_perf(&perf);
+    uint32_t words[USB_STATUS_WORDS] = {
+        request->op,result,info.last_error,info.configured,info.running,
+        info.settings.nominal_sps,info.settings.gain,info.settings.mode,ADS_MCLK_HZ,info.spi_hz,
+        stats.drdy,stats.frames,stats.busy_drdy,stats.queue_drops,stats.bad_frames,
+        stats.drdy_timeouts,stats.dma_timeouts,stats.dma_errors,stats.recoveries,stats.discarded_on_stop,
+        stats.queue_peak,link_state.sample_drops,link_state.peak,
+        (uint32_t)link_state.accepted_bytes,(uint32_t)(link_state.accepted_bytes>>32),
+        disconnects,stalls,stop_reason,ENABLE_ACQ_PROFILE,perf.drdy_irq.max_us,
+        perf.dma_irq.max_us,perf.poll_gap_max_us,perf.queue_age_max_us,stats.tainted_frames,
+        usb_task_max,main_max,link_state.head-link_state.tail,link_state.discarded_samples,
+        parser.malformed,info.fatal
+    };
+    (void)usb_link_reply(&link_state,request->op==USB_QUERY ? USB_STATUS : USB_REPLY,request->id,words);
 }
-
-static void handle_command(int c) {
-    ads1299_info_t v;
-    ads1299_get_info(&v);
-    switch (c) {
-    case '?': help(); break;
-    case 's': report_config(); wifi_stream_report(); break;
-    case 'p': debug_log("Preview disabled: raw transport only.\r\n"); break;
-    case 'x': report_result("stop", ads1299_stop()); break;
-    case 'g': report_result("start (use i if unconfigured)", ads1299_start()); break;
-    case 'i':
-        have_sample = false;
-        report_result("reset/config (standby)", ads1299_init(&settings));
-        report_config();
-        break;
-    case 'r': {
-        uint8_t regs[ADS_REG_COUNT];
-        bool resume = v.running;
-        bool ok = (!resume || ads1299_stop()) && ads1299_read_regs(0, regs, sizeof regs);
-        if (ok) for (unsigned a = 0; a < ADS_REG_COUNT; ++a) debug_log("REG %02x = %02x\r\n", a, regs[a]);
-        if (resume && ok) ok = ads1299_start();
-        report_result("register dump", ok);
-        break;
-    }
-    case 't': case 'h': case 'n': {
-        ads1299_settings_t requested = settings;
-        requested.mode = c == 't' ? ADS_MODE_TEST : c == 'h' ? ADS_MODE_SHORT : ADS_MODE_NORMAL;
-        bool ok = ads1299_configure(&requested);
-        if (ok) { settings = requested; have_sample = false; }
-        report_result("mode/config (standby)", ok);
-        report_config();
-        break;
-    }
-#if ENABLE_SD_CARD
-    case 'b':
-        if (ads1299_stop()) { sd_legacy_run(); have_sample = false; }
-        break;
-#endif
-    case -1: case '\r': case '\n': case ' ': break;
-    default: debug_log("Unknown command; type ?\r\n"); break;
-    }
-}
-
-static void handle_usb_input(void) {
-    for (unsigned i = 0; i < USB_COMMAND_CHARS_PER_POLL; ++i) {
-        int c = debug_console_getchar();
-        if (c < 0) break;
-        usb_command_t command = usb_command_feed(&command_parser, c);
-        if (command.kind == USB_CMD_NONE) continue;
-        if (command.kind == USB_CMD_LEGACY) { handle_command((int)command.value); break; }
-        if (command.kind == USB_CMD_ERROR) {
-            debug_log("Command FAILED: %s; acquisition unchanged.\r\n", command.error);
-            parameter_help(); break;
+static void execute(const usb_request_t *request) {
+    unsigned result=USB_OK;
+    if (request->op>USB_MODE || ((request->op<=USB_STOP) && request->value)) result=USB_BAD_COMMAND;
+    else if(request->op==USB_START) {
+        if(!running) {
+            ads1299_info_t info; ads1299_get_info(&info);
+            /* Explicit START retries a latched configuration fault; never automatic. */
+            if(!info.configured && !ads1299_init(&settings)) result=USB_ADC_ERROR;
+            else if(!ads1299_start()) result=USB_ADC_ERROR;
+            else stop_reason=0;
         }
-        ads1299_info_t before, after;
-        ads1299_get_info(&before);
-        ads1299_change_t field = command.kind == USB_CMD_RATE ? ADS_CHANGE_RATE : ADS_CHANGE_GAIN;
-        unsigned old = field == ADS_CHANGE_RATE ? before.settings.nominal_sps : before.settings.gain;
-        ads1299_error_t error;
-        ads1299_change_result_t result = ads1299_change(&settings, field, command.value, &error);
-        ads1299_get_info(&after);
-        if (result != ADS_CHANGE_UNCHANGED && (!after.running || result == ADS_CHANGE_APPLIED)) have_sample = false;
-        debug_log("%s old=%u requested=%" PRIu32 ": %s; error=%s run=%d configured=%d\r\n",
-                  field == ADS_CHANGE_RATE ? "rate" : "gain", old, command.value,
-                  result == ADS_CHANGE_APPLIED ? "APPLIED" : result == ADS_CHANGE_UNCHANGED ? "UNCHANGED" : "FAILED",
-                  ads1299_error_name(error), after.running, after.configured);
-        report_config();
-        if (result == ADS_CHANGE_FAILED) {
-            if (error == ADS_ERR_SPI_BUDGET)
-                debug_log("SPI preflight/apply limit: MCLK=%u base=%u max=%u; require frame time <75%% period and valid MCLK.\r\n",
-                          (unsigned)ADS_MCLK_HZ, (unsigned)ADS_SPI_HZ, (unsigned)ADS_SPI_MAX_HZ);
-            parameter_help();
+    } else if(request->op==USB_STOP) {
+        if(!stop(1)) result=USB_ADC_ERROR;
+    } else if(request->op>=USB_RATE) {
+        if(running) result=USB_BAD_STATE;
+        else {
+            ads1299_settings_t requested=settings;
+            if(request->op==USB_RATE) requested.nominal_sps=request->value;
+            else if(request->op==USB_GAIN) requested.gain=request->value;
+            else requested.mode=(ads1299_mode_t)request->value;
+            uint32_t target;
+            if(!ads1299_preflight(&requested,&target)) result=USB_ADC_ERROR;
+            else if(!ads1299_configure(&requested)) result=USB_ADC_ERROR;
+            else settings=requested;
         }
-        break; /* At most one command/configuration transaction per main-loop pass. */
     }
+    reply(request,result);
 }
-
 int main(void) {
-    ads1299_power_on(); /* GP21 goes HIGH before any USB initialization/wait. */
-    (void)debug_console_init();
-    wifi_stream_init();
-    bool ok = ads1299_init(&settings); /* Explicit user START required. */
-    wifi_stream_launch();
-    report_result("startup", ok);
-    report_config();
-    help();
-    uint64_t last_report = time_us_64();
-    uint32_t previous_frames = 0;
-    uint64_t next_auxiliary = 0;
-    uint32_t loop_count = 0;
-    bool was_connected = false;
-    while (true) {
-        bool measure = (++loop_count & 63u) == 0;
-        uint32_t began = measure ? time_us_32() : 0;
-        ads1299_poll();
-        for (unsigned i = 0; i < 16u && ads1299_get_frame(&latest); ++i) {
-            have_sample = true;
-            wifi_stream_submit(&latest);
-        }
-        if (measure) perf_add(&acquisition_time, time_us_32() - began);
-        uint64_t now = time_us_64();
-        if (now < next_auxiliary) { tight_loop_contents(); continue; }
-        next_auxiliary = now + 1000u; /* USB and control: at most 1 kHz. */
-        began = time_us_32();
-        debug_console_poll();
-        bool connected = debug_console_connected();
-        if (connected && !was_connected) { report_config(); help(); }
-        was_connected = connected;
-        handle_usb_input();
-#if ENABLE_WIFI_STREAM
-        wifi_control_apply(&settings);
+    ads1299_power_on();
+    usb_link_init(&link_state);
+    ads1299_set_state_callback(acquisition_state);
+    (void)ads1299_init(&settings);
+    (void)tud_init(0); /* No stdio driver: this CDC carries binary messages only. */
+    bool have_request=false;
+    usb_request_t request={0};
+    uint32_t last_progress=time_us_32();
+    while(true) {
+#if ENABLE_ACQ_PROFILE
+        uint32_t loop_began=time_us_32();
 #endif
-        perf_add(&auxiliary_time, time_us_32() - began);
-        now = time_us_64();
-        if (now - last_report >= 1000000u) {
-            previous_frames = report_status(now - last_report, previous_frames);
-            wifi_stream_report();
-            last_report = now;
+        bool was_running=running;
+        ads1299_poll();
+        if(was_running && !running) stop_reason=4;
+        /* Drain bounded acquisition work before servicing USB. */
+        uint32_t now=time_us_32();
+        for(unsigned i=0;i<64;i++) {
+            const ads1299_raw_frame_t *raw=ads1299_peek_raw();
+            if(!raw) break;
+            if(connected) (void)usb_link_offer(&link_state,raw,now);
+            ads1299_consume_raw();
         }
+#if ENABLE_ACQ_PROFILE
+        uint32_t usb_began=time_us_32();
+#endif
+        tud_task_ext(0,false); /* Handles queued events, no timeout wait. */
+#if ENABLE_ACQ_PROFILE
+        uint32_t usb_elapsed=time_us_32()-usb_began;
+        if(usb_elapsed>usb_task_max) usb_task_max=usb_elapsed;
+#endif
+        bool open=tud_cdc_connected(); /* Requires DTR; disables TinyUSB FIFO overwrite. */
+        if(lost_connection || (connected && !open)) {
+            stop(2); ++disconnects;
+            usb_link_disconnect(&link_state);
+            tud_cdc_write_clear(); tud_cdc_read_flush();
+            parser.used=0; have_request=false; connected=false; lost_connection=false;
+        }
+        if(open && !connected) { connected=true; last_progress=time_us_32(); }
+        if(connected) {
+            if(!have_request) {
+                for(unsigned i=0;i<64 && tud_cdc_available();i++) {
+                    uint8_t byte; if(tud_cdc_read(&byte,1)!=1) break;
+                    if(usb_parse(&parser,byte,&request)) { have_request=true; break; }
+                }
+            }
+            /* Reserve response storage before applying side effects. */
+            if(have_request && usb_link_reply_room(&link_state)) {
+                execute(&request); have_request=false;
+            }
+            now=time_us_32(); usb_link_tick(&link_state,now);
+            unsigned written=usb_link_pump(&link_state,usb_write,NULL,4096);
+            (void)tud_cdc_write_flush();
+            bool pending=link_state.head!=link_state.tail || tud_cdc_write_available()<CFG_TUD_CDC_TX_BUFSIZE;
+            if(written || !pending) last_progress=now;
+            else if(running && now-last_progress>=2000000u) { stop(3); ++stalls; }
+        }
+#if ENABLE_ACQ_PROFILE
+        uint32_t elapsed=time_us_32()-loop_began;
+        if(elapsed>main_max) main_max=elapsed;
+#endif
         tight_loop_contents();
     }
 }

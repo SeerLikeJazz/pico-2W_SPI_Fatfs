@@ -1,6 +1,10 @@
+> **当前默认版本：纯 USB 隔离固件（2026-09-15）。** Wi-Fi/Core 1/SD/日志不参与构建；USB 只传 AUSB 二进制命令、按需状态及 raw 数据。运行方法、Core 0 审查及实机步骤见 [USB_ISOLATION](docs/USB_ISOLATION.md)，协议见 [USB_PROTOCOL](docs/USB_PROTOCOL.md)。iSensys 扫描波形、暂留、跨通道显示及新实测见 [SWEEP_DISPLAY](docs/SWEEP_DISPLAY.md)。下文为历史 Wi-Fi 版本参考，不适用于当前默认固件。
+
 > 2026-09-14 优化更新：所有采样率固定 15 MHz SPI（校验实际分频），固件仅传 raw、关闭预览和解码；EEG1 数据版本为 2，无 CRC；上位机关闭 5001 每 2 秒周期查询。以下历史说明中与此冲突的自适应 SPI、预览及 CRC 描述已被替代。详细变更与实测步骤见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，当前协议见 [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md)。
 
 # Pico 2 W / 单片 ADS1299 调试说明
+
+USB 上位机新增参考滤波、软件触发和 BDF+ 保存（2026-09-16），操作与验证见 [USB_FEATURES](docs/USB_FEATURES.md)。
 
 本工程默认上电打开 ADS1299 电源，用 SPI0 + RX/TX DMA 采集 8 通道，USB CDC 输出诊断信息。默认 **内部测试配置、增益 1、250 SPS（以 2.048 MHz MCLK 为前提），上电待机**，需要上位机“开始显示”或 USB g 显式启动。SD、UART 日志、25 Hz 抽样预览默认关闭。新增 Core 1 Wi-Fi 热点和 TCP 数据流默认开启，见 [Wi-Fi 调试说明](docs/WIFI_DEBUG.md) 和 [协议 V1](docs/PROTOCOL_V1.md)；`ENABLE_WIFI_STREAM=OFF` 可恢复单核采集构建。没有加入屏幕或板端数据存盘。
 

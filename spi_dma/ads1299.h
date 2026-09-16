@@ -19,7 +19,7 @@ typedef struct {
 typedef struct {
     uint32_t drdy, frames, busy_drdy, queue_drops, discarded_on_stop;
     uint32_t drdy_timeouts, dma_timeouts, dma_errors, bad_frames;
-    uint32_t spi_timeouts, recoveries, queue_peak;
+    uint32_t spi_timeouts, recoveries, queue_peak, tainted_frames;
 } ads1299_stats_t;
 typedef struct {
     uint8_t id, expected[ADS_REG_COUNT], readback[ADS_REG_COUNT];
@@ -42,7 +42,15 @@ bool ads1299_configure(const ads1299_settings_t *settings); /* Leaves stopped. *
 bool ads1299_preflight(const ads1299_settings_t *settings, uint32_t *spi_request);
 bool ads1299_start(void);
 bool ads1299_stop(void);
-void ads1299_poll(void); /* Watchdog + max two automatic recovery attempts. */
+void ads1299_poll(void); /* Fault latches and stops; no automatic restart. */
+typedef struct {
+    uint8_t raw[ADS_FRAME_BYTES];
+    uint32_t sequence;
+    uint64_t timestamp_us;
+} ads1299_raw_frame_t;
+/* Borrow until consume; main context must not stop/reset while borrowed. */
+const ads1299_raw_frame_t *ads1299_peek_raw(void);
+void ads1299_consume_raw(void);
 /* Supplies raw/sequence/timestamp only; no channel decoding. */
 bool ads1299_get_frame(ads1299_frame_t *frame);
 void ads1299_get_stats(ads1299_stats_t *stats);
